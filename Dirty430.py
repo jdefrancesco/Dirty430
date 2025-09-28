@@ -1,19 +1,30 @@
 # Dirty430.py - Ghidra script to fix up MSP430F5438 binaries. It first labels all memory
 # mapped registers and creates functions at interrupt vectors if need be.
 # After that we attempt to clean the C up a bit by doing the following:
-# - Clean Mult/Div functions. The MSP cannot do either so you will see it adding or subtracting in a loop 
-#   to do the operation. We make the C easier to read by using * and / operators.
+#  - MUL/DIV SimplIfications (No hardware support on msp430s)
+#  - Bitmask macro cleanup
+#  - Switch recovery
+#  - Struct detection
+#  - Peripheral register renaming (if mapping provided)
+#  - Constant folding
+#
 
 #@author J. DeFrancesco 
 #@category MSP430
-#@keybinding 
-#@menupath 
-#@toolbar 
-#@runtime PyGhidra
 
 from ghidra.util import Msg # pyright: ignore[reportMissingModuleSource]
 from ghidra.program.model.symbol import SourceType # pyright: ignore[reportMissingModuleSource]
 from ghidra.program.model.data import ByteDataType, WordDataType # pyright: ignore[reportMissingModuleSource]
+from ghidra.program.model.address import AddressOutOfBoundsException # pyright: ignore[reportMissingModuleSource]
+
+# Decompilation imports...
+from ghidra.app.decompiler import DecompInterface
+from ghidra.program.model.pcode import PcodeOp
+from ghidra.util.task import ConsoleTaskMonitor
+# from ghidra.app.decompiler.clang import ClangTokenGroup
+from ghidra.program.model.listing import CodeUnit
+
+
 
 # Embedded memory mapped registers for the MSP430F5438. 
 # Hardcoded for now from the msp430f5438.h file.
@@ -346,68 +357,206 @@ gPM = currentProgram
 gMEM = gPM.getMemory()
 gSYMTAB = gPM.getSymbolTable()
 
+
+# Script is idempotent by default, only creating labels/functions/data if missing.
+# Set FORCE_OVERWRITE = True to allow the script to clear existing data/instructions
+# in target regions before redefining them (vector table or embedded regs). Use with
+# caution: only the exact byte ranges being created are cleared.
+FORCE_OVERWRITE = False  
+
+# Verbose logging toggle: when True, log every skip/decision; when False, only key actions.
+VERBOSE = True
+
+# Statistics (populated during run)
+_STAT = {
+    'data_created': 0,
+    'data_skipped_existing': 0,
+    'data_skipped_overlap_data': 0,
+    'data_skipped_instr': 0,
+    'data_skipped_instr_overlap': 0,
+    'ranges_cleared': 0,
+}
+
+def _addr_int(a):
+    """Return integer offset for either an int/long or a Ghidra Address-like object."""
+    if a is None:
+        return 0
+    # Ghidra Address objects have getOffset / getUnsignedOffset
+    if hasattr(a, 'getOffset'):
+        try:
+            return int(a.getOffset())
+        except Exception:
+            pass
+    try:
+        return int(a)
+    except Exception:
+        return 0
+
+def fmt_addr(a):
+    """Format an address or int as 0xXXXXXXXX (uppercase)."""
+    return "0x%X" % _addr_int(a)
+
+def _log(msg, kind='info', always=False):
+    """Internal logging wrapper: emits via Msg and also prints for the script console.
+    kind: 'info' | 'warn' | 'error'. If always=True, ignore VERBOSE flag.
+    """
+    if not VERBOSE and not always:
+        # Still show final summary lines (they use always=True) but skip noisy items.
+        return
+    if kind == 'warn':
+        Msg.warn(None, msg)
+    elif kind == 'error':
+        Msg.error(None, msg)
+    else:
+        Msg.info(None, msg)
+    try:
+        print(msg)
+    except Exception:
+        pass
+
 def to_addr(addr):
     """Convert an integer to an Address object."""
 
     return gPM.getAddressFactory().getDefaultAddressSpace().getAddress(addr)
 
-def mem_has(aadr):
+def mem_has(a_addr):
     """Check if memory contains the given address."""
 
     try:
-        return gMEM.contains(to_addr(aadr))
+        return gMEM.contains(to_addr(a_addr))
     except AddressOutOfBoundsException as e:
-        Msg.error(f"Address out of bounds: {e}")
+        Msg.error(None, "[!] Address out of bounds: %s" % e )
         return False
 
 
 def make_data(addr, word_size):
-    """Create data at the given address with the specified word size (1 or 2 bytes)."""
+    """Create data at the given address with the specified word size (1 or 2 bytes).
+    Returns True if created, False if it already existed or failed."""
 
-    Msg.info(None, "Creating data at 0x%X of size %d" % (a_addr, word_size))
-    a_addr = to_addr(addr)
-    try:
-        if getDataAt(a_addr) is not None:
-            try:
-                removeDataAt(a_addr)
-            except:
-                pass
-        if word_size == 2:
-            createData(a_addr, WordDataType.dataType)
+    a = to_addr(addr)
+    end_addr = a.add(word_size - 1)
+    existing_exact = getDataAt(a)
+    existing_containing = getDataContaining(a)
+    existing_instr = getInstructionAt(a)
+    containing_instr = getInstructionContaining(a)
+
+    def _clear_range():
+        try:
+            clearListing(a, end_addr)
+            _log("[i] Cleared listing %s-%s for overwrite" % (fmt_addr(a), fmt_addr(end_addr)))
+            _STAT['ranges_cleared'] += 1
+            return True
+        except Exception as ce:
+            _log("[!] Failed clearing %s-%s: %s" % (fmt_addr(a), fmt_addr(end_addr), ce), 'warn', always=True)
+            _log("[i] Skipping data at %s (already exact)" % fmt_addr(a))
+            return False
+
+    # Existing data exact
+    if existing_exact is not None:
+        if FORCE_OVERWRITE:
+            if not _clear_range():
+                return False
         else:
-            createData(a_addr, ByteDataType.dataType)
+            _STAT['data_skipped_existing'] += 1
+            return False
+    # Containing data
+    if existing_containing is not None and existing_containing.getMinAddress() != a:
+        if FORCE_OVERWRITE:
+            if not _clear_range():
+                return False
+        else:
+            _log("[i] Skipping data at %s (inside existing %s at %s)" % (
+                fmt_addr(a), existing_containing.getDataType().getName(), fmt_addr(existing_containing.getMinAddress())))
+            _STAT['data_skipped_overlap_data'] += 1
+            return False
+
+    # Instruction overlap
+    if existing_instr is not None:
+        if FORCE_OVERWRITE:
+            if not _clear_range():
+                return False
+        else:
+            _log("[i] Skipping data at %s (instruction already present)" % fmt_addr(a))
+            _STAT['data_skipped_instr'] += 1
+            return False
+    if containing_instr is not None and containing_instr.getMinAddress() != a:
+        if FORCE_OVERWRITE:
+            if not _clear_range():
+                return False
+        else:
+            Msg.info(None, "[i] Skipping data at %s (inside instruction at %s)" % (
+                fmt_addr(a), fmt_addr(containing_instr.getMinAddress())))
+            _STAT['data_skipped_instr_overlap'] += 1
+            return False
+
+    try:
+        createData(a, WordDataType.dataType if word_size == 2 else ByteDataType.dataType)
+        _STAT['data_created'] += 1
+        return True
     except Exception as e:
-        Msg.warn(None, "create_data failed at 0x%X: %s" % (a_addr, str(e)))
+        _log("[!] Failed to create data at %s: %s" % (fmt_addr(a), e), 'warn', always=True)
+        return False
 
 
 def make_label(addr, name):
     """Create a label at the given address with the specified name."""
 
     a_addr = to_addr(addr)
-    Msg.info(None, "Creating label %s at 0x%X" % (name, a_addr))
+    Msg.info(None, "[i] Creating label %s at %s" % (name, fmt_addr(a_addr)))
+    for s in gPM.getSymbolTable().getSymbols(a_addr):
+        if s.getSource() == SourceType.USER_DEFINED:
+            return False  # user label exists, skip
+
+    createLabel(a_addr, name, True, SourceType.USER_DEFINED)
+    return True
+
+
+def add_external_entry_point(addr):
+    """Set external entry point at the given address."""
+    a_addr = to_addr(addr)
+    Msg.info(None, "[i] Adding external entry point at %s" % fmt_addr(a_addr))
     try:
-        createLabel(a_addr, name, True, SourceType.USER_DEFINED)
-    except:
-        try:
-            gPM.getSymbolTable().createLabel(a_addr, name, SourceType.USER_DEFINED)
-        except Exception as e:
-            Msg.warn(None, "create_label failed %s@0x%X: %s" % (name, a_addr, str(e)))
+        gPM.getSymbolTable().addExternalEntryPoint(a_addr)
+        return True
+    except Exception as e:
+        Msg.warn(None, "[!] addExternalEntryPoint failed %s: %s" % (fmt_addr(a_addr), e))
+        return False
+
+def make_function(addr, name):
+    """Create a function at the given address with the specified name."""
+
+    a_addr = to_addr(addr)
+    Msg.info(None, "[i] Creating function %s at %s" % (name, fmt_addr(a_addr)))
+    if getFunctionAt(a_addr) is not None:
+        Msg.info(None, "[i] Function already exists at %s" % fmt_addr(a_addr))
+        return False
+
+    createFunction(a_addr, name)
+    Msg.info(None, "[i] Created function %s at %s" % (name, fmt_addr(a_addr)))
+    return True
+
 
 def main():
-    """Main function houses the bulk of Ghidra script logic."""
+    """Main function... """
 
-    # Counters
+    Msg.info(None, "======= Starting Dirty430 script!  =======\n\n")
+
     applied = 0
-
     Msg.info(None, "[*] Attempting to resolve/create vector functions/labels...")
 
-    # vectors region (0xFF80..0xFFFF) create words & label and attempt to resolve ISR targets
+    # Vectors region (0xFF80..0xFFFF) create words & label and attempt to resolve ISR targets
+    # Handles 20-bit addresses by just resolving the low 16 bits for now...
     for va in range(0xFF80, 0x10000, 2):
         if not mem_has(va):
             continue
 
-        make_data(va, 2)
-        make_label(va, "VECTOR_%04X" % va)
+        # Data at vector entry
+        if FORCE_OVERWRITE or getDataAt(to_addr(va)) is None:
+            make_data(va, 2)
+
+        # Add label (if missing)
+        if FORCE_OVERWRITE or not any(s.getSource() == SourceType.USER_DEFINED for s in gSYMTAB.getSymbols(to_addr(va))):
+            make_label(va, "VEC_0x%04X" % va)
 
         try:
             low = getShort(to_addr(va)) & 0xFFFF
@@ -416,26 +565,59 @@ def main():
 
         if low is not None:
             resolved = None
-            for hb in range(0, 0x10):
+            for hb in range(0, 16):  # Check high byte possibilities
                 cand = (hb << 16) | low
                 if mem_has(cand):
                     resolved = cand
                     break
             if resolved is None and mem_has(low):
-                resolved = low
-            if resolved is not None:
-                try:
-                    if getFunctionAt(to_addr(resolved)) is None:
-                        createFunction(to_addr(resolved), "ISR_%04X" % resolved)
-                        
-                    make_label(resolved, "ISR_TARGET_%04X" % resolved)
-                except:
-                    Msg.warn(None, "Failed to create function at 0x%X" % resolved)
-                    pass
-                
-            applied += 1
+                resolved = low  # Maybe it's just a 16-bit address
 
-        Msg.info(None, "[*] Applied %d vector fixes" % applied)
-    
+            if resolved:
+                if FORCE_OVERWRITE or getFunctionAt(to_addr(resolved)) is None:
+                    make_function(resolved, "ISR_0x%04X" % resolved)
+
+                make_label(resolved, "ISR_0x%04X" % resolved)
+
+                if va == 0xFFFE:
+                    # Reset vector, create entry point
+                    add_external_entry_point(resolved)
+
+        applied += 1
+
+    _log("[i] Created %d vector entries" % applied, always=True)
+
+    # Now creeate memory mapped registers... Reset counter.
+    applied = 0
+    _log("[i] Attempting to resolve/create embedded register labels...", always=True)
+    for addr, (name, width) in EMBEDDED_REGS.items():
+        if not mem_has(addr):
+            continue
+
+
+        # Delegate decision (and FORCE_OVERWRITE handling) to make_data
+        make_data(addr, width)
+
+        if FORCE_OVERWRITE or not any(s.getSource() == SourceType.USER_DEFINED for s in gPM.getSymbolTable().getSymbols(to_addr(addr))):
+            make_label(addr, name)
+
+        applied += 1     
+
+    _log("[i] Created %d embedded register entries" % applied, always=True)
+
+    # Summary statistics
+    _log("\n======= Dirty430 Summary =======", always=True)
+    _log("FORCE_OVERWRITE: %s" % FORCE_OVERWRITE, always=True)
+    _log("VERBOSE: %s" % VERBOSE, always=True)
+    _log("Data created: %d" % _STAT['data_created'], always=True)
+    _log("Ranges cleared: %d" % _STAT['ranges_cleared'], always=True)
+    _log("Skipped existing (exact): %d" % _STAT['data_skipped_existing'], always=True)
+    _log("Skipped overlap data: %d" % _STAT['data_skipped_overlap_data'], always=True)
+    _log("Skipped instruction exact: %d" % _STAT['data_skipped_instr'], always=True)
+    _log("Skipped instruction overlap: %d" % _STAT['data_skipped_instr_overlap'], always=True)
+    _log("================================\n", always=True)
+
+    Msg.info(None, "[*] Finished Dirty430 script!")
+
 if __name__ == "__main__":
     main()
