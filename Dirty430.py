@@ -1,6 +1,7 @@
 # Dirty430.py - Ghidra script to fix up MSP430F5438 binaries. It first labels all memory
 # mapped registers and creates functions at interrupt vectors if need be.
 # After that we attempt to clean the C up a bit by doing the following:
+
 #  - MUL/DIV SimplIfications (No hardware support on msp430s)
 #  - Bitmask macro cleanup
 #  - Switch recovery
@@ -8,8 +9,9 @@
 #  - Peripheral register renaming (if mapping provided)
 #  - Constant folding
 #
+# - Will be provided in another module during debug.
 
-#@author J. DeFrancesco 
+#@author J. DeFrancesco
 #@category MSP430
 
 from ghidra.util import Msg # pyright: ignore[reportMissingModuleSource]
@@ -26,7 +28,7 @@ from ghidra.program.model.listing import CodeUnit
 
 
 
-# Embedded memory mapped registers for the MSP430F5438. 
+# Embedded memory mapped registers for the MSP430F5438.
 # Hardcoded for now from the msp430f5438.h file.
 EMBEDDED_REGS = {
     0x00010: ("ADC12MEM7", 2),
@@ -360,14 +362,14 @@ gSYMTAB = gPM.getSymbolTable()
 
 # Script is idempotent by default, only creating labels/functions/data if missing.
 # Set FORCE_OVERWRITE = True to allow the script to clear existing data/instructions
-# in target regions before redefining them (vector table or embedded regs). Use with
-# caution: only the exact byte ranges being created are cleared.
-FORCE_OVERWRITE = False  
+# in target regions before redefining them. Use with
+# caution. You could screw up analysis Ghidra did already.
+FORCE_OVERWRITE = False
 
 # Verbose logging toggle: when True, log every skip/decision; when False, only key actions.
 VERBOSE = True
 
-# Statistics (populated during run)
+# Stats..
 _STAT = {
     'data_created': 0,
     'data_skipped_existing': 0,
@@ -377,10 +379,14 @@ _STAT = {
     'ranges_cleared': 0,
 }
 
+
+# TODO: UGLY refactor some day.
 def _addr_int(a):
     """Return integer offset for either an int/long or a Ghidra Address-like object."""
+
     if a is None:
         return 0
+
     # Ghidra Address objects have getOffset / getUnsignedOffset
     if hasattr(a, 'getOffset'):
         try:
@@ -393,13 +399,14 @@ def _addr_int(a):
         return 0
 
 def fmt_addr(a):
-    """Format an address or int as 0xXXXXXXXX (uppercase)."""
+    """Format an address or int as 0xXXXXXXXX cause it annoys me."""
+
     return "0x%X" % _addr_int(a)
 
+
 def _log(msg, kind='info', always=False):
-    """Internal logging wrapper: emits via Msg and also prints for the script console.
-    kind: 'info' | 'warn' | 'error'. If always=True, ignore VERBOSE flag.
-    """
+    """Internal logging wrapper: emits via Msg and also prints for the script console..."""
+
     if not VERBOSE and not always:
         # Still show final summary lines (they use always=True) but skip noisy items.
         return
@@ -414,10 +421,12 @@ def _log(msg, kind='info', always=False):
     except Exception:
         pass
 
+
 def to_addr(addr):
     """Convert an integer to an Address object."""
 
     return gPM.getAddressFactory().getDefaultAddressSpace().getAddress(addr)
+
 
 def mem_has(a_addr):
     """Check if memory contains the given address."""
@@ -459,6 +468,7 @@ def make_data(addr, word_size):
         else:
             _STAT['data_skipped_existing'] += 1
             return False
+
     # Containing data
     if existing_containing is not None and existing_containing.getMinAddress() != a:
         if FORCE_OVERWRITE:
@@ -479,6 +489,7 @@ def make_data(addr, word_size):
             _log("[i] Skipping data at %s (instruction already present)" % fmt_addr(a))
             _STAT['data_skipped_instr'] += 1
             return False
+
     if containing_instr is not None and containing_instr.getMinAddress() != a:
         if FORCE_OVERWRITE:
             if not _clear_range():
@@ -546,6 +557,7 @@ def main():
 
     # Vectors region (0xFF80..0xFFFF) create words & label and attempt to resolve ISR targets
     # Handles 20-bit addresses by just resolving the low 16 bits for now...
+    # TODO: Refactor ugliness
     for va in range(0xFF80, 0x10000, 2):
         if not mem_has(va):
             continue
@@ -594,14 +606,12 @@ def main():
         if not mem_has(addr):
             continue
 
-
-        # Delegate decision (and FORCE_OVERWRITE handling) to make_data
         make_data(addr, width)
 
         if FORCE_OVERWRITE or not any(s.getSource() == SourceType.USER_DEFINED for s in gPM.getSymbolTable().getSymbols(to_addr(addr))):
             make_label(addr, name)
 
-        applied += 1     
+        applied += 1
 
     _log("[i] Created %d embedded register entries" % applied, always=True)
 
@@ -617,6 +627,7 @@ def main():
     _log("Skipped instruction overlap: %d" % _STAT['data_skipped_instr_overlap'], always=True)
     _log("================================\n", always=True)
 
+    # Peace out homies..
     Msg.info(None, "[*] Finished Dirty430 script!")
 
 if __name__ == "__main__":

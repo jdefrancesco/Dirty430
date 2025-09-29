@@ -12,9 +12,11 @@ The plugin has two simple phases:
 
 **NOTE:** This plugin is hardcoded for the `MSP430f5438` microcontroller. However, it can be easily adapted to other `MSP430` variants by modifying the relevant parameters in the code.
 
-The following sources can be references: <ADD TOOLKIT>
+The following sources can be references: <ADD TOOLKIT LINK>
 
 ## Post Decompile Phase Optimizations.
+
+NOTE: Developed in seperate module for now. Heavily adapted from one of my old IDA Scripts.
 
 The cleaning of Decompiled code can go a long way for the `MSP430`:
 We attempt to apply the following to decompilation output:
@@ -23,7 +25,6 @@ We attempt to apply the following to decompilation output:
   - Bitmask macro cleanup
   - Switch recovery
   - Struct detection
-  - Peripheral register renaming (if mapping provided)
   - Constant folding
 
 
