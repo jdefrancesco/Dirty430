@@ -2,7 +2,9 @@
 # mapped registers and creates functions at interrupt vectors if need be.
 # After that we attempt to clean the C up a bit by doing the following:
 
+# NOTE: See DirtyDecompiler.py.
 #  - MUL/DIV SimplIfications (No hardware support on msp430s)
+#  - Cleanup any weird stack behavior (to some degree anyway)
 #  - Bitmask macro cleanup
 #  - Switch recovery
 #  - Struct detection
@@ -398,12 +400,15 @@ def _addr_int(a):
     except Exception:
         return 0
 
+
 def fmt_addr(a):
     """Format an address or int as 0xXXXXXXXX cause it annoys me."""
 
     return "0x%X" % _addr_int(a)
 
 
+# Found this somewhere on github and seemed good enough for our purposes. Had to make a 
+# few changes.
 def _log(msg, kind='info', always=False):
     """Internal logging wrapper: emits via Msg and also prints for the script console..."""
 
@@ -628,7 +633,7 @@ def main():
     _log("================================\n", always=True)
 
     # Peace out homies..
-    Msg.info(None, "[*] Finished Dirty430 script!")
+    Msg.info(None, "[*] Finished Dirty430 PHASE 1!")
 
 if __name__ == "__main__":
     main()
