@@ -278,7 +278,7 @@ def main():
     
     
     For now I am keeping this seperate from phase one clean up for debug utility and ease.
-    Will combine into a single Dirty430 script for portability with minimal dependencys!
+    Will combine into a single Dirty430 script for portability with minimal dependencies!
     """
 
 
