@@ -366,7 +366,7 @@ gSYMTAB = gPM.getSymbolTable()
 # Set FORCE_OVERWRITE = True to allow the script to clear existing data/instructions
 # in target regions before redefining them. Use with
 # caution. You could screw up analysis Ghidra did already.
-FORCE_OVERWRITE = False
+FORCE_OVERWRITE = True
 
 # Verbose logging toggle: when True, log every skip/decision; when False, only key actions.
 VERBOSE = True
@@ -552,6 +552,40 @@ def make_function(addr, name):
     return True
 
 
+_VECTOR_HIGH_BYTES = tuple(range(16))
+
+
+def _has_user_defined_symbol(addr_obj):
+    """Return True if a user defined symbol exists at the address."""
+    for symbol in gSYMTAB.getSymbols(addr_obj):
+        if symbol.getSource() == SourceType.USER_DEFINED:
+            return True
+    return False
+
+
+def _vector_label(addr):
+    return "VEC_0x%04X" % addr
+
+
+def _isr_label(addr):
+    return "ISR_0x%04X" % addr
+
+
+def _safe_short(addr_obj):
+    try:
+        return getShort(addr_obj) & 0xFFFF
+    except Exception:
+        return None
+
+
+def _resolve_vector_target(low_word, has_mem):
+    for high in _VECTOR_HIGH_BYTES:
+        candidate = (high << 16) | low_word
+        if has_mem(candidate):
+            return candidate
+    return low_word if has_mem(low_word) else None
+
+
 def main():
     """Main function... """
 
@@ -562,43 +596,43 @@ def main():
 
     # Vectors region (0xFF80..0xFFFF) create words & label and attempt to resolve ISR targets
     # Handles 20-bit addresses by just resolving the low 16 bits for now...
-    # TODO: Refactor ugliness
+    mem_contains = mem_has
+    to_address = to_addr
     for va in range(0xFF80, 0x10000, 2):
-        if not mem_has(va):
+        if not mem_contains(va):
             continue
 
+        addr_obj = to_address(va)
+
         # Data at vector entry
-        if FORCE_OVERWRITE or getDataAt(to_addr(va)) is None:
+        if FORCE_OVERWRITE or getDataAt(addr_obj) is None:
             make_data(va, 2)
 
         # Add label (if missing)
-        if FORCE_OVERWRITE or not any(s.getSource() == SourceType.USER_DEFINED for s in gSYMTAB.getSymbols(to_addr(va))):
-            make_label(va, "VEC_0x%04X" % va)
+        if FORCE_OVERWRITE or not _has_user_defined_symbol(addr_obj):
+            make_label(va, _vector_label(va))
 
-        try:
-            low = getShort(to_addr(va)) & 0xFFFF
-        except:
-            low = None
+        low_word = _safe_short(addr_obj)
+        if low_word is None:
+            applied += 1
+            continue
 
-        if low is not None:
-            resolved = None
-            for hb in range(0, 16):  # Check high byte possibilities
-                cand = (hb << 16) | low
-                if mem_has(cand):
-                    resolved = cand
-                    break
-            if resolved is None and mem_has(low):
-                resolved = low  # Maybe it's just a 16-bit address
+        resolved = _resolve_vector_target(low_word, mem_contains)
+        if not resolved:
+            applied += 1
+            continue
 
-            if resolved:
-                if FORCE_OVERWRITE or getFunctionAt(to_addr(resolved)) is None:
-                    make_function(resolved, "ISR_0x%04X" % resolved)
+        resolved_addr = to_address(resolved)
+        isr_name = _isr_label(resolved)
 
-                make_label(resolved, "ISR_0x%04X" % resolved)
+        if FORCE_OVERWRITE or getFunctionAt(resolved_addr) is None:
+            make_function(resolved, isr_name)
 
-                if va == 0xFFFE:
-                    # Reset vector, create entry point
-                    add_external_entry_point(resolved)
+        make_label(resolved, isr_name)
+
+        if va == 0xFFFE:
+            # Reset vector, create entry point
+            add_external_entry_point(resolved)
 
         applied += 1
 

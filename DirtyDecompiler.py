@@ -13,23 +13,74 @@
 #  - Constant folding
 #  - Adjusting any weird stack behavior
 
+# XXX: Will be merged into Dirty430.py single script after tested.
 
 #@author J. DeFrancesco
 #@category MSP430 Decompiler Cleanup
+
+import re
 
 from ghidra.util import Msg # pyright: ignore[reportMissingModuleSource]
 from ghidra.app.decompiler import DecompInterface
 from ghidra.program.model.pcode import PcodeOp
 from ghidra.util.task import ConsoleTaskMonitor
-from ghidra.app.decompiler.clang import ClangTokenGroup
 from ghidra.program.model.listing import CodeUnit
 
 
+# Different builds keep it either in clang or decompiler package...
+try:
+    from ghidra.app.decompiler.clang import ClangTokenGroup
+    HAVE_CLANG = True
+except Exception:
+    try:
+        from ghidra.app.decompiler import ClangTokenGroup  #
+        HAVE_CLANG = True
+    except Exception:
+        ClangTokenGroup = None
+        HAVE_CLANG = False
 
-## UTIL FUNCS TEMP.
+try:
+    from ghidra.program.flatapi import FlatProgramAPI
+except Exception:
+    FlatProgramAPI = None
 
+
+
+# ---- Conext management ----
+# This are for keeping context import safe.
+PROGRAM = None
+ADDRESS = None
+MONITOR = None
+
+def set_ctx(program=None, address=None, monitor=None):
+    """Initialize context when called from the REPL or wrapper.
+       If args are None, try to pull from __main__ (REPL/script env)."""
+
+    import __main__
+    global PROGRAM, ADDRESS, MONITOR
+
+    if program is None:
+        program = getattr(__main__, 'currentProgram', None)
+    if address is None:
+        address = getattr(__main__, 'currentAddress', None)
+    if monitor is None:
+        monitor = getattr(__main__, 'monitor', None)
+    if program is None:
+        raise RuntimeError("DirtyDecompiler.set_ctx: supply program=currentProgram or run as a Ghidra script.")
+    PROGRAM, ADDRESS, MONITOR = program, address, monitor
+
+def _ensure_ctx():
+    """Call at the start of any function that touches PROGRAM/ADDRESS/MONITOR."""
+    if PROGRAM is None:
+        set_ctx()  
+
+# ---- End context management ----
+
+
+# Debug verbosity
 VERBOSE = True
 
+# TODO: When we merge the components we won't need this anymore.
 def fmt_addr(a):
     """Format an address or int as 0xXXXXXXXX cause it annoys me."""
 
@@ -71,24 +122,66 @@ def _log(msg, kind='info', always=False):
         pass
 
 
-def get_decompiled_function(func):
-    """This call initializes new decompiler process. Only needs to be called when first ran
+def get_decompiled_function(func, program=None, timeout=60):
+    """Return DecompileResults for func. Works when imported if set_ctx() was called."""
     
+    if program is None:
+        _ensure_ctx()
+        program = PROGRAM
     
-    NOTE: currentProgram is set by Ghidra along with the others in their scripting docs..
-    """
-
     ifc = DecompInterface()
-    ifc.openProgram(currentProgram)
 
-    return ifc.decompileFunction(func, 60, ConsoleTaskMonitor())
+    try:
+        opts = ifc.getOptions()
+        opts.setParameterIdEnabled(True)
+        ifc.setOptions(opts)
+    except Exception:
+        pass
+
+    ifc.openProgram(program)
+
+    _log("[D430] decompiling helper invoked on %s..." % func.getName())
+    return ifc.decompileFunction(func, timeout, ConsoleTaskMonitor())
+
+
+
+def decompile(func, program=None, timeout=60):
+    """This call initializes new decompiler process. Only needs to be called when first ran """
+
+    # Call decompiler function...
+    res = get_decompiled_function(func, program=program, timeout=timeout)
+    if not res or not res.decompileCompleted():
+        return None, None, []
+
+    hf = res.getHighFunction()
+
+    # Collect our tokens and ensure we can walk/rewrite them.
+    tokens = []
+    if HAVE_CLANG:
+        root = res.getCCodeMarkup()  # ClangTokenGroup tree
+        if root is not None:
+            def walk(node):
+                try:
+                    n = node.numChildren()
+                except Exception:
+                    return
+                for i in range(n):
+                    ch = node.Child(i)
+                    tokens.append(ch)
+                    if isinstance(ch, ClangTokenGroup):
+                        walk(ch)
+            walk(root)
+    else:
+        _log("DirtyDecompiler: Clang token API not available; token rewrites disabled.", 'warn', always=True)
+
+    _log("decomp: got %d tokens for %s" % (len(tokens), func.getName()))
+    _log("decomp: decompiled %s to %s" % (func.getName(), res.getCCodeMarkup().toString()), 'debug')
+    return res, hf, tokens
+ 
 
 
 def replace_tokens(tokens, start_addr, new_text):
-    """Replaces tokens is our utility function used to replace C operators and 
-
-    similar tokens. 
-    """
+    """Replaces tokens is our utility function to change C tokens""" 
     
     for tok in tokens:
         if tok.getMinAddress() == start_addr:
@@ -98,6 +191,7 @@ def replace_tokens(tokens, start_addr, new_text):
                 parent.addText(new_text)
                 return True
                 
+    _log("replace_tokens: failed to find token at %s" % fmt_addr(start_addr), 'warn', always=True)
     return False
 
 
@@ -115,8 +209,9 @@ def simplify_arithmetic(high_func, tokens):
             addr = block.getStart()
             # Provide more readable C op. subs..
             if replace_tokens(tokens, addr, "sum = counter * constant; // simplified"):
-                _log("[Arithmetic] Simplified loop at %s " % fmt_addr(addr))
+                _log("[arithmetic] Simplified loop at %s " % fmt_addr(addr))
 
+    _log("[arithmetic] Done")
     return
 
 
@@ -147,8 +242,9 @@ def bitmask_macros(high_func, tokens):
                         macro = "CLEAR_BITS({}".format(out.getHigh().getName()) + " ,0x{:X}".format(const_val)
                     
                     replace_tokens(tokens, op.getSeqnum().getTarget(), macro)
-                    _log("[Bitmask] Rewrote at %s "  % op.getSeqnum().getTarget())
+                    _log("[bitmask] Rewrote at %s "  % op.getSeqnum().getTarget())
 
+    _log("[bitmask] Done") 
     return
 
 def constant_folding(high_func, tokens):
@@ -173,6 +269,7 @@ def constant_folding(high_func, tokens):
                 if replace_tokens(tokens, addr, "x = y; // const-folded"):
                     _log("[ConstFold] Folded at %s" %  fmt_addr(addr))
 
+    _log("[constfold] Done")
     return
 
 
@@ -205,6 +302,7 @@ def memset_replace(high_func, tokens):
     if hints: 
         _log("dirty430: memset hints %d" %  hints)
 
+    _log("[memset] Done")
     return
 
 
@@ -232,13 +330,13 @@ def struct_recovery(high_func, tokens):
             # Mark with comment.
             replace_tokens(tokens, addr_list[i-1], "// struct field sequence detected")
             _log("[Struct] Fields near %s " % fmt_addr(addr_list[i-1]))
-            
-    return 
+
+    _log("[struct] Done")
+    return
+
             
 def switch_table_hint(high_func, tokens):
-    """
-    switch_table_hint suggests the replacement of a switch with a cleaner
-    table lookup in certain cases.
+    """switch_table_hint suggests the replacement of switch to table.
 
     Table lookups occur a lot with various functions including crypto functions
     which might make idenitfy them a bit more clear.
@@ -260,7 +358,8 @@ def switch_table_hint(high_func, tokens):
         if target and len(consts)>=3:
             # construct table C looking thingy for now.
             # These are constants of a possible table in hex.
-            arr_elements = ", ".join(f"0x{v:X}" for v in consts)
+            # arr_elements = ", ".join(f"0x{v:X}" for v in consts)
+            arr_elements = ", ".join("0x%X" % v for v in consts)
             # C table replacement. Just using this for time being can fill in real types might be used 
             # when i've proved it worth it.
             text = "static const uint16_t dirty430_tbl[] = \{ {} \};\n".format(arr_elements) +  "{} = dirty430_tbl[...]; ".format(target)
@@ -270,42 +369,200 @@ def switch_table_hint(high_func, tokens):
     if collapsed: 
         _log("[dirty430] switch lookup has been collapsed: %s" % collapsed)
 
+    
+    _log("[switch] Done")
     return
 
 
-def main():
-    """Main. NOTE: THIS IS MEANT TO BE RUN PER FGUNCTION..
+
+def pass_resume_points(high_func, tokens):
+    """ Detects stores to the fixed local slot (SP-4) with a code-like constant and:
+
+      - creates a label at that address (if plausible),
+      - rewrites the store as 'resume_pc = 0xXXXX; // resume label',
+      - tries to rename the stack var to 'resume_pc'.
+    """
     
-    
-    For now I am keeping this seperate from phase one clean up for debug utility and ease.
-    Will combine into a single Dirty430 script for portability with minimal dependencies!
+    fpa = FlatProgramAPI(program=PROGRAM)
+    mem = PROGRAM.getMemory()
+    labeled = 0
+    rewrote = 0
+
+
+    ## TODO(REFACTOR)
+
+    # Match: *(undefined4 *)(<something> - 4) = 0x1234;
+    _PAT_RESUME = re.compile(r"\*\s*\(\s*undefined4\s*\*\s*\)\s*\(\s*[^)]+-\s*4\s*\)\s*=\s*0x([0-9A-Fa-f]+)\s*;")
+ 
+
+    def _mk_addr(off):
+        return PROGRAM.getAddressFactory().getDefaultAddressSpace().getAddress(off)
+    ## END HELPTER
+
+    # Try to rename the stack symbol at -4 into resume_pc (best effort)
+    try:
+        symmap = high_func.getLocalSymbolMap()
+        for s in symmap.getSymbols():
+            # crude heuristic: first undefined4 on stack near -4
+            if "undefined4" in str(s.getDataType()):
+                storage = s.getStorage()
+                # storage dump is noisy; skip hard test and just rename the first candidate
+                try:
+                    if s.getName().startswith("local_") or "unaff" in s.getName():
+                        s.rename("resume_pc")
+                        break
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    for tok in tokens:
+        s = str(tok)
+        if "undefined4" not in s:
+            continue
+        m = _PAT_RESUME.search(s)
+        if not m:
+            continue
+        val = int(m.group(1), 16)
+        addr = _mk_addr(val & 0xFFFF)  # many firmwares use 16-bit vector/code addrs
+        # label if looks like valid code
+        try:
+            if mem.contains(addr):
+                try:
+                    fpa.createLabel(addr, "L_resume_%04X" % (val & 0xFFFF), True)
+                    labeled += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # rewrite the assignment text
+        line = "resume_pc = 0x%X; // Dirty430: resume point" % val
+        if replace_tokens(tokens, tok.getMinAddress(), line):
+            rewrote += 1
+
+    if labeled or rewrote:
+        _log("decomp: resume points labeled=%d, rewritten=%d" % (labeled, rewrote))
+
+
+def pass_fix_msp430x_20bit_ptr(tokens):
+    """Rewrites MSP430X 20-bit effective address construction into a clean wrap.
+    Example in -> puVar4 = (undefined2 *)(long)(int3)(unaff_R3 + (int3)puVar4 & 0xfffff);
+    Example out -> puVar4 = (uint16_t *)(((uint32_t)unaff_R3 + (uint32_t)(uintptr_t)puVar4) & 0xFFFFF); // dirty430 20-bit
     """
 
+    def _group_text(node):
+        # best-effort stringify the node subtree
+        try:
+            n = node.numChildren()
+            parts = []
+            for i in range(n):
+                parts.append(str(node.Child(i)))
+            return "".join(parts)
+        except:
+            return str(node)
 
-    func = getFunctionContaining(currentAddress)
-    if not func:
-        _log("dirty430: No function at current address.")
+    # Matches:  LHS = (undefined2 *)(long)(int3)(BASE + (int3)PTR & 0xfffff);
+    _PAT_20BIT = re.compile(
+        r"""(?P<lhs>\w+)\s*=\s*
+            \(\s*undefined2\s*\*\s*\)\s*
+            \(\s*long\s*\)\s*
+            \(\s*int3\s*\)\s*
+            \(\s*(?P<base>\w+)\s*\+\s*
+            \(\s*int3\s*\)\s*(?P<ptr>\w+)\s*&\s*0x[fF]{5}\s*\)
+            \s*;?""",
+        re.X
+    )
+
+    fixes = 0
+    for tok in tokens:
+        s = str(tok)
+        # Fast filter: only bother if this token looks like the mask
+        if "0xfffff" not in s and "0xFFFFF" not in s:
+            continue
+        parent = tok.getParent()
+        if not isinstance(parent, ClangTokenGroup):
+            continue
+
+        text = _group_text(parent)
+        m = _PAT_20BIT.search(text)
+        if not m:
+            continue
+
+        lhs  = m.group("lhs")
+        base = m.group("base")
+        ptr  = m.group("ptr")
+
+        new_line = "{lhs} = (uint16_t *)(((uint32_t){base} + (uint32_t)(uintptr_t){ptr}) & 0xFFFFF); ".format(lhs=lhs, base=base, ptr=ptr) 
+        
+
+        # Replace at this node's address (same trick as your other passes)
+        if _replace(tokens, tok.getMinAddress(), new_line):
+            fixes += 1
+
+    if fixes:
+        _log("decomp: 20-bit ptr wrap simplified {fixes} site(s)".format(fixes=fixes))
+
+
+
+def clean_function(func):
+    """Cleans up a single function's decompiled output."""
+
+    _log("[D430] Attempting to clean %s" % func.getName())
+
+    res, high_func, tokens = decompile(func)
+    if not res:
+        _log("decomp: failed %s" % func.getName(), 'warn', always=True)
         return
-
-    res = get_decompiled_function(func)
-    if not res.decompileCompleted():
-        _log("dirty430: Decompilation failed for %s"  func.getName())
-        return
-
-    high_func = res.getHighFunction()
-    tokens = res.getCFunction().getTokens()
-
     simplify_arithmetic(high_func, tokens)
     bitmask_macros(high_func, tokens)
     constant_folding(high_func, tokens)
     switch_table_hint(high_func, tokens)
     struct_recovery(high_func, tokens)
     memset_replace(high_func, tokens)
+    pass_resume_points(high_func, tokens)
+    pass_fix_msp430x_20bit_ptr(tokens)
+
+    _log("decomp: cleaned %s" % func.getName())
 
 
-    # peripheral_renaming(high_func, tokens) - done by first script as pre-pass for now. But just in case
-    # this might need a second pass or something..
+def run_current():
+    _ensure_ctx()
 
+    func = getFunctionContaining(ADDRESS)
+    if not func:
+        _log("[D430]: No function at current address.", 'warn', always=True)
+        return
+    clean_function(func)
+
+
+def run_all():
+    """Cleans all functions in the current program."""
+
+    _ensure_ctx()
+
+    fm = PROGRAM.getFunctionManager()
+    it = fm.getFunctions(True)
+
+    i = 0
+    while it.hasNext():
+        clean_function(it.next())
+        i += 1
+    _log("[D430]: cleaned %d function(s)" % i, always=True)
+
+
+def main():
+    """Main
+    
+    Entry point when run as a script. This deals specifically with cleaning
+    up decompilation output caused by messy MSP430 code generation using Ghidra.
+    """
+
+    # Initialize context if needed.
+    set_ctx()
+
+    # Run only on current function.
+    run_current()
 
 if __name__ == "__main__":
     main()
