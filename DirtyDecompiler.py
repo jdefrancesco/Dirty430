@@ -104,6 +104,7 @@ def _addr_int(a):
         return 0
 
 
+
 def _log(msg, kind='info', always=False):
     """Internal logging wrapper: emits via Msg and also prints for the script console..."""
 
@@ -117,7 +118,7 @@ def _log(msg, kind='info', always=False):
     else:
         Msg.info(None, msg)
     try:
-        _log(msg)
+        print(msg)
     except Exception:
         pass
 
@@ -175,23 +176,35 @@ def decompile(func, program=None, timeout=60):
         _log("DirtyDecompiler: Clang token API not available; token rewrites disabled.", 'warn', always=True)
 
     _log("decomp: got %d tokens for %s" % (len(tokens), func.getName()))
-    _log("decomp: decompiled %s to %s" % (func.getName(), res.getCCodeMarkup().toString()), 'debug')
     return res, hf, tokens
  
 
 
 def replace_tokens(tokens, start_addr, new_text):
     """Replaces tokens is our utility function to change C tokens""" 
-    
+
     for tok in tokens:
-        if tok.getMinAddress() == start_addr:
+        # Skip structural or non-token elements that lack expected attributes
+        if not hasattr(tok, "getParent") or not hasattr(tok, "getMinAddress"):
+            continue
+
+        try:
+            addr = tok.getMinAddress()
+        except Exception:
+            continue
+
+        if addr == start_addr:
             parent = tok.getParent()
-            if isinstance(parent, ClangTokenGroup):
-                parent.removeChildren()
-                parent.addText(new_text)
-                return True
-                
-    _log("replace_tokens: failed to find token at %s" % fmt_addr(start_addr), 'warn', always=True)
+            if parent and hasattr(parent, "removeChildren") and hasattr(parent, "addText"):
+                try:
+                    parent.removeChildren()
+                    parent.addText(new_text)
+                    return True
+                except Exception as e:
+                    _log("replace_tokens: error replacing token: {}".format(e), "warn")
+                    return False
+
+    _log("replace_tokens: failed to find token at %s" % fmt_addr(start_addr), "warn", always=True)
     return False
 
 
@@ -199,7 +212,7 @@ def simplify_arithmetic(high_func, tokens):
     """Replace repeated-addition loops with multiply op."""
 
     for block in high_func.getBasicBlocks():
-        ops = list(block.getPcodeOps())
+        ops = [op for op in block.getIterator()]
 
         # Look for basic blocks that use repeated addition/sub heuristic.
         add_ops = [op for op in ops if op.getOpcode() == PcodeOp.INT_ADD]
@@ -224,12 +237,12 @@ def bitmask_macros(high_func, tokens):
 
     # Simple and might not catch everything but we will try
     for block in high_func.getBasicBlocks():
-        ops = list(block.getPcodeOps())
+        ops = [op for op in block.getIterator()]
         for op in ops:
             if op.getOpcode() in (PcodeOp.INT_AND, PcodeOp.INT_OR):
-
+                input_count = op.getNumInputs() if hasattr(op, "getNumInputs") else op.getInputCount()
                 out = op.getOutput()
-                inputs = [op.getInput(i) for i in range(op.getNumInputs())]
+                inputs = [op.getInput(i) for i in range(input_count)]
 
                 if len(inputs) == 2 and inputs[1].isConstant():
                     const_val = inputs[1].getOffset()
@@ -256,13 +269,15 @@ def constant_folding(high_func, tokens):
     """
 
     for block in high_func.getBasicBlocks():
-        ops = list(block.getPcodeOps())
+        ops = [op for op in block.getIterator()]
         if len(ops) >= 2:
             # Get first and second operators
             first, second = ops[0], ops[1]
+            first_input_count = first.getNumInputs() if hasattr(first, "getNumInputs") else first.getInputCount()
+            second_input_count = second.getNumInputs() if hasattr(second, "getNumInputs") else second.getInputCount()
 
-            if (first.getOpcode() == PcodeOp.COPY and first.getInput(0).isConstant() and
-                second.getOpcode() == PcodeOp.INT_ADD and second.getInput(0) == first.getOutput()):
+            if (first.getOpcode() == PcodeOp.COPY and first_input_count >= 1 and first.getInput(0).isConstant() and
+                second.getOpcode() == PcodeOp.INT_ADD and second_input_count >= 1 and second.getInput(0) == first.getOutput()):
 
                 addr = first.getSeqnum().getTarget()
 
@@ -315,11 +330,9 @@ def struct_recovery(high_func, tokens):
 
     addr_list = []
     for block in high_func.getBasicBlocks():
-        for op in block.getPcodeOps():
-            
+        for op in [op for op in block.getIterator()]:
             if op.getOpcode() == PcodeOp.LOAD:
                 base = op.getInput(1)
-
                 if base and base.isAddress():
                     addr_list.append(base.getAddress())
 
@@ -344,18 +357,18 @@ def switch_table_hint(high_func, tokens):
 
     collapsed = 0
     for bb in high_func.getBasicBlocks():
-        ops = list(bb.getPcodeOps())
+        ops = [op for op in bb.getIterator()]
         consts = []
         target = None
 
         for op in ops:
-            if op.getOpcode() == PcodeOp.COPY and op.getInputCount() == 1 and op.getInput(0).isConstant():
+            input_count = op.getNumInputs() if hasattr(op, "getNumInputs") else op.getInputCount()
+            if op.getOpcode() == PcodeOp.COPY and input_count == 1 and op.getInput(0).isConstant():
                 consts.append(op.getInput(0).getOffset())
-
                 if op.getOutput(): 
                     target = op.getOutput().getHigh().getName()
 
-        if target and len(consts)>=3:
+        if target and len(consts) >= 3:
             # construct table C looking thingy for now.
             # These are constants of a possible table in hex.
             # arr_elements = ", ".join(f"0x{v:X}" for v in consts)
@@ -383,7 +396,10 @@ def pass_resume_points(high_func, tokens):
       - tries to rename the stack var to 'resume_pc'.
     """
     
-    fpa = FlatProgramAPI(program=PROGRAM)
+    try:
+        fpa = FlatProgramAPI(PROGRAM, MONITOR or ConsoleTaskMonitor())
+    except TypeError:
+        fpa = FlatProgramAPI(program=PROGRAM)
     mem = PROGRAM.getMemory()
     labeled = 0
     rewrote = 0
@@ -558,6 +574,7 @@ def main():
     up decompilation output caused by messy MSP430 code generation using Ghidra.
     """
 
+    _log("[D430] Dirty Decompiler script starting...", always=True)
     # Initialize context if needed.
     set_ctx()
 
