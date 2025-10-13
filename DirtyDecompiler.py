@@ -463,6 +463,7 @@ def pass_resume_points(high_func, tokens):
 
 def pass_fix_msp430x_20bit_ptr(tokens):
     """Rewrites MSP430X 20-bit effective address construction into a clean wrap.
+
     Example in -> puVar4 = (undefined2 *)(long)(int3)(unaff_R3 + (int3)puVar4 & 0xfffff);
     Example out -> puVar4 = (uint16_t *)(((uint32_t)unaff_R3 + (uint32_t)(uintptr_t)puVar4) & 0xFFFFF); // dirty430 20-bit
     """
