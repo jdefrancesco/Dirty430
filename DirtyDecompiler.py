@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # DirtyDecompiler.py
 
 # Performs multiple cleanups on MSP430 decompiled output:
@@ -9,7 +10,6 @@
 #  - Bitmask macro cleanup
 #  - Switch recovery
 #  - Struct detection
-#  - Peripheral register renaming (if mapping provided)
 #  - Constant folding
 #  - Adjusting any weird stack behavior
 
@@ -29,11 +29,11 @@ from ghidra.program.model.listing import CodeUnit
 
 # Different builds keep it either in clang or decompiler package...
 try:
-    from ghidra.app.decompiler.clang import ClangTokenGroup
+    from ghidra.app.decompiler.clang import ClangTokenGroup, ClangToken
     HAVE_CLANG = True
 except Exception:
     try:
-        from ghidra.app.decompiler import ClangTokenGroup  #
+        from ghidra.app.decompiler import ClangTokenGroup, ClangToken  #
         HAVE_CLANG = True
     except Exception:
         ClangTokenGroup = None
@@ -47,10 +47,12 @@ except Exception:
 
 
 # ---- Conext management ----
+
 # This are for keeping context import safe.
 PROGRAM = None
 ADDRESS = None
 MONITOR = None
+
 
 def set_ctx(program=None, address=None, monitor=None):
     """Initialize context when called from the REPL or wrapper.
@@ -79,12 +81,16 @@ def _ensure_ctx():
 
 # Debug verbosity
 VERBOSE = True
+# Global to hold the current Clang markup root
+_CCODE_ROOT = None
 
-# TODO: When we merge the components we won't need this anymore.
+
+# ----- HELPERS. When we merge the components we won't need this anymore.
 def fmt_addr(a):
     """Format an address or int as 0xXXXXXXXX cause it annoys me."""
 
     return "0x%X" % _addr_int(a)
+
 
 def _addr_int(a):
     """Return integer offset for either an int/long or a Ghidra Address-like object."""
@@ -104,7 +110,6 @@ def _addr_int(a):
         return 0
 
 
-
 def _log(msg, kind='info', always=False):
     """Internal logging wrapper: emits via Msg and also prints for the script console..."""
 
@@ -122,6 +127,61 @@ def _log(msg, kind='info', always=False):
     except Exception:
         pass
 
+
+def _replace(tokens, addr, text):
+    """Wrapper around. Will refactor later..."""
+    return replace_tokens(tokens, addr, text)
+
+
+def _flatten_clang_tokens(root):
+    """Return a flat list of leaf ClangToken from a ClangTokenGroup tree."""
+
+    out = []
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        # Groups have children; tokens don’t.
+        try:
+            cnt = n.numChildren()
+        except Exception:
+            cnt = 0
+        if cnt > 0:
+            for i in range(cnt - 1, -1, -1):
+                stack.append(n.Child(i))
+        else:
+            # Keep only real tokens (not punctuation groups etc.)
+            if 'ClangToken' in type(n).__name__:
+                out.append(n)
+    return out
+
+
+def _addr_contains(node, addr):
+    try:
+        a0 = node.getMinAddress()
+        a1 = node.getMaxAddress()
+        return a0 is not None and a1 is not None and a0.compareTo(addr) <= 0 and a1.compareTo(addr) >= 0
+    except Exception:
+        return False
+
+
+def _find_enclosing_group(root, addr):
+    """Return the smallest ClangTokenGroup whose address range contains addr."""
+
+    best = None
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, ClangTokenGroup) and _addr_contains(n, addr):
+            best = n  # candidate
+            try:
+                for i in range(n.numChildren()-1, -1, -1):
+                    stack.append(n.Child(i))
+            except Exception:
+                pass
+    return best
+
+
+# ----- Core Functions 
 
 def get_decompiled_function(func, program=None, timeout=60):
     """Return DecompileResults for func. Works when imported if set_ctx() was called."""
@@ -145,7 +205,6 @@ def get_decompiled_function(func, program=None, timeout=60):
     return ifc.decompileFunction(func, timeout, ConsoleTaskMonitor())
 
 
-
 def decompile(func, program=None, timeout=60):
     """This call initializes new decompiler process. Only needs to be called when first ran """
 
@@ -161,17 +220,7 @@ def decompile(func, program=None, timeout=60):
     if HAVE_CLANG:
         root = res.getCCodeMarkup()  # ClangTokenGroup tree
         if root is not None:
-            def walk(node):
-                try:
-                    n = node.numChildren()
-                except Exception:
-                    return
-                for i in range(n):
-                    ch = node.Child(i)
-                    tokens.append(ch)
-                    if isinstance(ch, ClangTokenGroup):
-                        walk(ch)
-            walk(root)
+            tokens = _flatten_clang_tokens(root)
     else:
         _log("DirtyDecompiler: Clang token API not available; token rewrites disabled.", 'warn', always=True)
 
@@ -179,32 +228,45 @@ def decompile(func, program=None, timeout=60):
     return res, hf, tokens
  
 
-
 def replace_tokens(tokens, start_addr, new_text):
-    """Replaces tokens is our utility function to change C tokens""" 
-
+    """Replace text at a statement corresponding to start_addr.
+    
+    1. Try an exact leaf-token match.
+    2. Fallback: rewrite the smallest enclosing ClangTokenGroup that spans the address.
+    """
+    
+    # Exact leaf match
     for tok in tokens:
-        # Skip structural or non-token elements that lack expected attributes
-        if not hasattr(tok, "getParent") or not hasattr(tok, "getMinAddress"):
+        if not hasattr(tok, "getMinAddress"):
             continue
-
         try:
-            addr = tok.getMinAddress()
-        except Exception:
-            continue
-
-        if addr == start_addr:
-            parent = tok.getParent()
-            if parent and hasattr(parent, "removeChildren") and hasattr(parent, "addText"):
-                try:
+            if tok.getMinAddress() == start_addr:
+                parent = None
+                try: parent = tok.Parent()
+                except Exception: pass
+                if parent and hasattr(parent, "removeChildren") and hasattr(parent, "addText"):
                     parent.removeChildren()
                     parent.addText(new_text)
+                    # Yay, return now.
                     return True
-                except Exception as e:
-                    _log("replace_tokens: error replacing token: {}".format(e), "warn")
-                    return False
+        except Exception:
+            pass
 
-    _log("replace_tokens: failed to find token at %s" % fmt_addr(start_addr), "warn", always=True)
+    # Enclosing-group fallback
+    root = globals().get('_CCODE_ROOT')
+    if root is not None:
+        grp = _find_enclosing_group(root, start_addr)
+
+        if grp and hasattr(grp, "removeChildren") and hasattr(grp, "addText"):
+            try:
+                grp.removeChildren()
+                grp.addText(new_text)
+                return True
+            except Exception as e:
+                _log("replace_tokens fallback failed: %s" % e, "warn")
+
+    # No luck
+    _log("replace_tokens: failed to find token/group at %s" % fmt_addr(start_addr), "warn", always=True)
     return False
 
 
@@ -254,11 +316,14 @@ def bitmask_macros(high_func, tokens):
                     else:
                         macro = "CLEAR_BITS({}".format(out.getHigh().getName()) + " ,0x{:X}".format(const_val)
                     
-                    replace_tokens(tokens, op.getSeqnum().getTarget(), macro)
-                    _log("[bitmask] Rewrote at %s "  % op.getSeqnum().getTarget())
+                    if replace_tokens(tokens, op.getSeqnum().getTarget(), macro):
+                        _log("[bitmask] Rewrote at %s "  % op.getSeqnum().getTarget())
+                    else:
+                        _log("[bitmask] No rewrite at %s" % op.getSeqnum().getTarget(), "warn")
 
     _log("[bitmask] Done") 
     return
+
 
 def constant_folding(high_func, tokens):
     """Replace sequences like x = 0; x += y; with x = y;
@@ -306,16 +371,19 @@ def memset_replace(high_func, tokens):
     hints = 0
     for tok in tokens:
         s = str(tok)
-        # Look for these tokens with cast and setting to zero.
         if "*(" in s and "= 0" in s:
-            parent = tok.getParent()
+            try:
+                parent = tok.Parent()
+            except Exception:
+                parent = None
             if parent:
                 try:
                     parent.addComment("dirty430: memset(buffer, 0, len) candidate")
                     hints += 1
-                except: pass
-    if hints: 
-        _log("dirty430: memset hints %d" %  hints)
+                except Exception:
+                    pass
+    if hints:
+        _log("dirty430: memset hints %d" % hints)
 
     _log("[memset] Done")
     return
@@ -369,27 +437,31 @@ def switch_table_hint(high_func, tokens):
                     target = op.getOutput().getHigh().getName()
 
         if target and len(consts) >= 3:
-            # construct table C looking thingy for now.
+            # Make C table construct.
             # These are constants of a possible table in hex.
             # arr_elements = ", ".join(f"0x{v:X}" for v in consts)
+            # arr_elements = ", ".join("0x%X" % v for v in consts)
+            # text = "static const uint16_t dirty430_tbl[] = \{ {} \};\n".format(arr_elements) +  "{} = dirty430_tbl[...]; ".format(target)
             arr_elements = ", ".join("0x%X" % v for v in consts)
-            # C table replacement. Just using this for time being can fill in real types might be used 
-            # when i've proved it worth it.
-            text = "static const uint16_t dirty430_tbl[] = \{ {} \};\n".format(arr_elements) +  "{} = dirty430_tbl[...]; ".format(target)
+            text = "static const uint16_t dirty430_tbl[] = {{ {0} }};\n{1} = dirty430_tbl[/* idx */]; ".format(arr_elements, target)
+
             if  replace_tokens(tokens, bb.getStart(), text):
                 collapsed += 1
+                _log("[D430] Created table.")
+            else:
+                _log("[D430] Skipping switch collapse")
 
     if collapsed: 
-        _log("[dirty430] switch lookup has been collapsed: %s" % collapsed)
+        _log("[D430] switch lookup has been collapsed: %s" % collapsed)
 
     
     _log("[switch] Done")
     return
 
 
-
 def pass_resume_points(high_func, tokens):
     """ Detects stores to the fixed local slot (SP-4) with a code-like constant and:
+    You see this pattern when dealing with state-machine like constructs sometimes..
 
       - creates a label at that address (if plausible),
       - rewrites the store as 'resume_pc = 0xXXXX; // resume label',
@@ -400,6 +472,7 @@ def pass_resume_points(high_func, tokens):
         fpa = FlatProgramAPI(PROGRAM, MONITOR or ConsoleTaskMonitor())
     except TypeError:
         fpa = FlatProgramAPI(program=PROGRAM)
+        
     mem = PROGRAM.getMemory()
     labeled = 0
     rewrote = 0
@@ -413,7 +486,6 @@ def pass_resume_points(high_func, tokens):
 
     def _mk_addr(off):
         return PROGRAM.getAddressFactory().getDefaultAddressSpace().getAddress(off)
-    ## END HELPTER
 
     # Try to rename the stack symbol at -4 into resume_pc (best effort)
     try:
@@ -440,7 +512,7 @@ def pass_resume_points(high_func, tokens):
         if not m:
             continue
         val = int(m.group(1), 16)
-        addr = _mk_addr(val & 0xFFFF)  # many firmwares use 16-bit vector/code addrs
+        addr = _mk_addr(val & 0xFFFF) 
         # label if looks like valid code
         try:
             if mem.contains(addr):
@@ -462,10 +534,14 @@ def pass_resume_points(high_func, tokens):
 
 
 def pass_fix_msp430x_20bit_ptr(tokens):
-    """Rewrites MSP430X 20-bit effective address construction into a clean wrap.
+    """Rewrites MSP430X 20-bit effective address construction into a more verbose
+    form thats easier to recognize (subjectively to me anyhow..)
 
     Example in -> puVar4 = (undefined2 *)(long)(int3)(unaff_R3 + (int3)puVar4 & 0xfffff);
     Example out -> puVar4 = (uint16_t *)(((uint32_t)unaff_R3 + (uint32_t)(uintptr_t)puVar4) & 0xFFFFF); // dirty430 20-bit
+    -> puVar4 = 0x0FFFF (20 bit addr)
+
+    TODO: REMOVE OR HANDLE ELSEWHERE
     """
 
     def _group_text(node):
@@ -497,7 +573,7 @@ def pass_fix_msp430x_20bit_ptr(tokens):
         # Fast filter: only bother if this token looks like the mask
         if "0xfffff" not in s and "0xFFFFF" not in s:
             continue
-        parent = tok.getParent()
+        parent = tok.Parent()
         if not isinstance(parent, ClangTokenGroup):
             continue
 
@@ -519,7 +595,6 @@ def pass_fix_msp430x_20bit_ptr(tokens):
 
     if fixes:
         _log("decomp: 20-bit ptr wrap simplified {fixes} site(s)".format(fixes=fixes))
-
 
 
 def clean_function(func):
@@ -576,6 +651,7 @@ def main():
     """
 
     _log("[D430] Dirty Decompiler script starting...", always=True)
+
     # Initialize context if needed.
     set_ctx()
 
