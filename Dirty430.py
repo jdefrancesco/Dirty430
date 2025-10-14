@@ -561,8 +561,7 @@ MSP430F5438_REG_BLOCKS = {
     ]},
 }
 
-# Selected high-signal regs we see a lot in firmware. Values are masks; multi-bit
-# fields are represented by individual bit positions (e.g., SELA0/1/2).
+# Selected high-signal regs we see a lot in firmware. 
 REG_BITFIELDS = {
     # Watchdog Timer Control
     'WDTCTL': {
@@ -636,7 +635,7 @@ _BITFIELD_ALIASES = {
 }
 
 
-
+# TODO: Can remove after refactor.
 gPM = currentProgram
 gMEM = gPM.getMemory()
 gSYMTAB = gPM.getSymbolTable()
@@ -646,7 +645,7 @@ PROGRAM = None
 ADDRESS = None
 MONITOR = None
 
-# HELPERS FOR IMPORT CONTEST
+# HELPERS FOR IMPORT Context.
 def set_ctx(program=None, address=None, monitor=None):
     """Initialize context when called from the REPL or wrapper."""
        
@@ -803,8 +802,6 @@ def apply_bitfield_comments():
     return applied
 
 
-
-
 def _infer_reg_width(name):
     """Return correct data width (1 or 2 bytes) for a given register name.
 
@@ -884,7 +881,6 @@ def _build_canonical_name_addr_map():
             mapping[name] = base + off
     return mapping
 
-
 def _effective_width(addr, name, default_width):
     """Pick a safe width to prevent overlap.
 
@@ -900,7 +896,6 @@ def _effective_width(addr, name, default_width):
         _log("[warn] Forcing BYTE at odd %s for %s (was WORD)" % (fmt_addr(addr), name), 'warn')
         w = 1
     return w
-
 
 def create_register_block_labels():
     """Create labels/data for MSP430F5438_REG_BLOCKS entries 
@@ -923,7 +918,6 @@ def create_register_block_labels():
             created += 1
 
     return created
-
 
 
 def make_data(addr, word_size):
@@ -998,15 +992,17 @@ def make_data(addr, word_size):
         d_cont = getDataContaining(a)
         i_cont = getInstructionContaining(a)
         rng = "%s..%s" % (fmt_addr(a), fmt_addr(end_addr))
+
         if d_cont is not None:
             _log("[!] Data conflict in %s vs existing DATA %s..%s (%s)" % (
                 rng, fmt_addr(d_cont.getMinAddress()), fmt_addr(d_cont.getMaxAddress()), d_cont.getDataType().getName()), 'warn', always=True)
+
         if i_cont is not None:
             _log("[!] Data conflict in %s vs existing INSN %s..%s" % (
                 rng, fmt_addr(i_cont.getMinAddress()), fmt_addr(i_cont.getMaxAddress())), 'warn', always=True)
+
         _log("[!] Failed to create data at %s: %s" % (fmt_addr(a), e), 'warn', always=True)
         return False
-
 
 def make_label(addr, name):
     """Create a label at the given address with the specified name."""
@@ -1019,7 +1015,6 @@ def make_label(addr, name):
 
     createLabel(a_addr, name, True, SourceType.USER_DEFINED)
     return True
-
 
 def install_msp430f5438_labels(program=None, logger=_log):
     """Create labels for MSP430F5438/5438A memory-mapped registers."""
@@ -1067,7 +1062,6 @@ def install_msp430f5438_labels(program=None, logger=_log):
         except: print(msg)
     return created
 
-
 def add_external_entry_point(addr):
     """Set external entry point at the given address."""
     a_addr = to_addr(addr)
@@ -1078,7 +1072,6 @@ def add_external_entry_point(addr):
     except Exception as e:
         Msg.warn(None, "[!] addExternalEntryPoint failed %s: %s" % (fmt_addr(a_addr), e))
         return False
-
 
 def make_function(addr, name):
     """Create a function at the given address with the specified name."""
@@ -1105,14 +1098,11 @@ def _has_user_defined_symbol(addr_obj):
             return True
     return False
 
-
 def _vector_label(addr):
     return "VEC_0x%04X" % addr
 
-
 def _isr_label(addr):
     return "ISR_0x%04X" % addr
-
 
 def _safe_short(addr_obj):
     try:
@@ -1122,6 +1112,11 @@ def _safe_short(addr_obj):
 
 
 def _resolve_vector_target(low_word, has_mem):
+    """
+    Creates a clean 16-bit address for vector table.
+    
+    Helper. Will move into a class/func on refactor"""
+
     for high in _VECTOR_HIGH_BYTES:
         candidate = (high << 16) | low_word
         if has_mem(candidate):
@@ -1138,8 +1133,9 @@ def install_reset_vector_info(addr):
     """
     pass
 
+
 def main():
-    """Main function... """
+    """Main function. """
 
     _log("======= Starting Dirty430 script!  =======\n\n")
 
@@ -1148,6 +1144,7 @@ def main():
 
     # Vectors region (0xFF80..0xFFFF) create words & label and attempt to resolve ISR targets
     # Handles 20-bit addresses by just resolving the low 16 bits for now...
+
     # TODO: Refactor this all into one function.
     mem_contains = mem_has
     to_address = to_addr
@@ -1170,6 +1167,7 @@ def main():
             applied += 1
             continue
 
+        # Resolve vector addr.
         resolved = _resolve_vector_target(low_word, mem_contains)
         if not resolved:
             applied += 1
@@ -1183,8 +1181,8 @@ def main():
 
         make_label(resolved, isr_name)
 
+        # Reset vector, create entry point
         if va == 0xFFFE:
-            # Reset vector, create entry point
             add_external_entry_point(resolved)
 
         applied += 1
@@ -1198,11 +1196,14 @@ def main():
     block_addrs = _build_block_addr_set()
     block_cov = _build_block_covered_set()
     canon_by_name = _build_canonical_name_addr_map()
+    
     for addr, (name, width) in sorted(EMBEDDED_REGS.items()):
         if addr in block_addrs:
-            # The block map is authoritative for this address; skip duplicate from EMBEDDED_REGS
+            # The block map is authoritative for this address for out chip.
+            # Skips duplicates..
             _log("[i] Skip dup (block owns) %s %s" % (fmt_addr(addr), name))
             continue
+
         # If this register name exists in the canonical (datasheet-derived) map
         # but at a different address, skip the stale entry from EMBEDDED_REGS.
         canon_addr = canon_by_name.get(name)
@@ -1210,20 +1211,26 @@ def main():
             _log("[i] Skip stale %s at %s (canonical %s)" % (
                 name, fmt_addr(addr), fmt_addr(canon_addr)))
             continue
+
         # Also skip any address that falls inside a word owned by the block map
         if addr in block_cov:
             _log("[i] Skip byte inside block word %s %s" % (fmt_addr(addr), name))
             continue
+
         if not mem_has(addr):
             continue
+
         w_eff = _effective_width(addr, name, width)
         if w_eff != width:
             _log("[i] Adjust width %s %s: %d->%d" % (fmt_addr(addr), name, width, w_eff))
+
         if not make_data(addr, w_eff):
             # Non-fatal; continue labeling when possible
             _log("[!] make_data skipped/failed at %s (%s)" % (fmt_addr(addr), name), 'warn')
+
         if FORCE_OVERWRITE or not any(s.getSource() == SourceType.USER_DEFINED for s in gPM.getSymbolTable().getSymbols(to_addr(addr))):
             make_label(addr, name)
+
         applied += 1
 
     # Insert more complete set of MSP430F5438 register labels
