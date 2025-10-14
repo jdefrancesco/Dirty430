@@ -668,7 +668,6 @@ def _ensure_ctx():
     if PROGRAM is None:
         set_ctx()  
 
-
 def _comment_text_for_bits(bits_dict):
     # Produce a compact one-line comment listing bit names and masks
     pairs = ["%s=0x%X" % (k, v) for (k, v) in sorted(bits_dict.items(), key=lambda kv: kv[1])]
@@ -1115,14 +1114,14 @@ def _resolve_vector_target(low_word, has_mem):
     """
     Creates a clean 16-bit address for vector table.
     
-    Helper. Will move into a class/func on refactor"""
+    Helper. Will move into a class/func on refactor
+    """
 
     for high in _VECTOR_HIGH_BYTES:
         candidate = (high << 16) | low_word
         if has_mem(candidate):
             return candidate
     return low_word if has_mem(low_word) else None
-
 
 
 def install_reset_vector_info(addr):

@@ -270,6 +270,12 @@ def replace_tokens(tokens, start_addr, new_text):
     return False
 
 
+# Annotiation passes
+
+
+
+
+
 def simplify_arithmetic(high_func, tokens):
     """Replace repeated-addition loops with multiply op."""
 
@@ -459,7 +465,7 @@ def switch_table_hint(high_func, tokens):
     return
 
 
-def pass_resume_points(high_func, tokens):
+# def pass_resume_points(high_func, tokens):
     """ Detects stores to the fixed local slot (SP-4) with a code-like constant and:
     You see this pattern when dealing with state-machine like constructs sometimes..
 
@@ -527,6 +533,122 @@ def pass_resume_points(high_func, tokens):
         # rewrite the assignment text
         line = "resume_pc = 0x%X; // Dirty430: resume point" % val
         if replace_tokens(tokens, tok.getMinAddress(), line):
+            rewrote += 1
+
+    if labeled or rewrote:
+        _log("decomp: resume points labeled=%d, rewritten=%d" % (labeled, rewrote))
+
+
+def pass_resume_points(high_func, tokens):
+    """
+    Detects stores to a fixed local stack slot (SP-3 or SP-4) with a code-like
+    constant and:
+      - creates a label at that address (if plausible),
+      - rewrites the store as 'resume_pc = 0xXXXXX; // resume label' (20-bit OK),
+      - tries to rename the stack var to 'resume_pc'.
+
+    Accepts MSP430X 20-bit encodings (undefined3 / int3) and classic 32-bit.
+    """
+
+    # FlatProgramAPI for labeling
+    try:
+        fpa = FlatProgramAPI(PROGRAM, MONITOR or ConsoleTaskMonitor())
+    except TypeError:
+        fpa = FlatProgramAPI(program=PROGRAM)
+
+    mem = PROGRAM.getMemory()
+    af  = PROGRAM.getAddressFactory()
+    dspace = af.getDefaultAddressSpace()
+
+    labeled = 0
+    rewrote = 0
+
+    # Try to rename the anonymous local (best-effort)
+    try:
+        symmap = high_func.getLocalSymbolMap()
+        for s in symmap.getSymbols():
+            dt = str(s.getDataType())
+            if ("undefined4" in dt) or ("uint32" in dt) or ("ulong" in dt) or ("undefined3" in dt):
+                try:
+                    nm = s.getName()
+                    if nm.startswith("local_") or "unaff" in nm:
+                        s.rename("resume_pc")
+                        break
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    #  Patterns that match both 32-bit and 20-bit store to SP-k (k in {3,4})
+    #    Examples it accepts:
+    #      *(undefined4 *)(SP - 4) = 0x1234;
+    #      *(undefined3 *)(SP - 3) = 0x12345;
+    #      *(undefined3 *)(fp - 3) = (int3)0x12345;
+    #
+    _PAT_RESUME = re.compile(
+        r"""\*\s*\(\s*(?:undefined4|uint32_t|ulong|long|undefined3|int3)\s*\*\)\s*
+             \(\s*[^)]*-\s*(?P<ofs>3|4)\s*\)\s*=\s*
+             (?:\(\s*(?:int3|uint32_t|ulong|long)\s*\)\s*)?
+             0x(?P<hex>[0-9A-Fa-f]{1,8})\s*;""",
+        re.X
+    )
+
+    def _fmt_hex20(v):
+        # Pretty print: 20-bit => 5 hex digits; 16-bit => 4; else generic
+        if v <= 0xFFFF:
+            return "0x%04X" % v
+        if v <= 0xFFFFF:
+            return "0x%05X" % v
+        return "0x%X" % v
+
+    def _mk_addr20(raw):
+        """Map raw constant to a program address, preferring 20-bit."""
+
+        #
+        try:
+            a = dspace.getAddress(raw & 0xFFFFF)
+            if mem.contains(a):
+                return a
+        except Exception:
+            pass
+        
+        try:
+            a = dspace.getAddress(raw)
+            if mem.contains(a):
+                return a
+        except Exception:
+            pass
+        return None
+
+    #  Scan leaf tokens for the pattern, rewrite, and label
+    for tok in tokens:
+        s = str(tok)
+        # Fast-filter: must look like a pointer store of a constant
+        if "*(" not in s or "= 0x" not in s:
+            continue
+        m = _PAT_RESUME.search(s)
+        if not m:
+            continue
+
+        val = int(m.group("hex"), 16)
+        ofs = int(m.group("ofs"))  # 3 or 4; we don't currently use it beyond diagnostics
+
+        a = _mk_addr20(val)
+        if a is not None:
+            try:
+                fpa.createLabel(a, "L_resume_%s" % _fmt_hex20(val).replace("0x", ""), True)
+                labeled += 1
+            except Exception:
+                pass
+
+        # Rewrite the assignment at this token site
+        line = "resume_pc = %s; // Dirty430: resume point" % _fmt_hex20(val)
+        try:
+            addr_for_replace = tok.getMinAddress()
+        except Exception:
+            addr_for_replace = None
+
+        if addr_for_replace and replace_tokens(tokens, addr_for_replace, line):
             rewrote += 1
 
     if labeled or rewrote:
@@ -606,6 +728,7 @@ def clean_function(func):
     if not res:
         _log("decomp: failed %s" % func.getName(), 'warn', always=True)
         return
+
     simplify_arithmetic(high_func, tokens)
     bitmask_macros(high_func, tokens)
     constant_folding(high_func, tokens)
