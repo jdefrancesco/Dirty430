@@ -270,10 +270,6 @@ def replace_tokens(tokens, start_addr, new_text):
     return False
 
 
-# Annotiation passes
-
-
-
 
 
 def simplify_arithmetic(high_func, tokens):
@@ -796,8 +792,238 @@ def pass_resume_points(high_func, tokens):
     if labeled or rewrote:
         _log("decomp: resume points labeled=%d, rewritten=%d" % (labeled, rewrote))
 
-from ghidra.program.model.listing import CodeUnit
-from ghidra.util.task import ConsoleTaskMonitor
+
+def annotate_store16_msp430x20_runs_all_in_one(high_func, min_run=2, gap_max=8,
+                                               require_20bit=False,  # <- default relaxed now
+                                               debug=False, debug_dump_limit=60):
+    """
+    MSP430X store-run annotator (relaxed):
+      - Finds STORE ops and tries to group into runs.
+      - Primary test: address-chain has AND with all-ones (16–20 bits).
+      - Fallback: many STORES whose address varnode is the *same register*
+                  within a short p-code distance (Ghidra already truncated).
+      - Classifies run as memset? (value==0), memcpy? (value comes from LOAD),
+        or table-fill? (value is CONST code-like).
+      - Annotates first op in a run + per-op light tags.
+
+    Tuning:
+      * increase min_run / change gap_max to be stricter/looser.
+      * set require_20bit=True to only keep runs with explicit mask evidence.
+    """
+    def _prog():
+        try: return PROGRAM
+        except NameError: return None
+    def _curprog():
+        try: return currentProgram
+        except NameError: return None
+
+    def _append_eol_comment_at(addr, text):
+        prog = _prog() or _curprog()
+        if not prog or not addr: return False
+        try:
+            listing = prog.getListing()
+            cu = listing.getCodeUnitAt(addr)
+            if cu is None:
+                try: disassemble(addr)
+                except Exception: pass
+                cu = listing.getCodeUnitAt(addr)
+            if cu is None: return False
+            old = cu.getComment(CodeUnit.EOL_COMMENT)
+            cu.setComment(CodeUnit.EOL_COMMENT, (old + " | " + text) if old else text)
+            try: createBookmark(addr, "Dirty430", text)
+            except Exception: pass
+            return True
+        except Exception:
+            return False
+
+    def _vn_size(vn):
+        try: return vn.getSize()
+        except: return None
+
+    def _is_all_ones_const(vn):
+        try:
+            if not vn or not vn.isConstant(): return (False, 0)
+            val = int(vn.getOffset()) & 0xFFFFFFFF
+            if val == 0: return (False, 0)
+            if (val & (val + 1)) != 0: return (False, 0)  # not (2^n - 1)
+            bits = (val + 1).bit_length() - 1
+            return (8 <= bits <= 32, bits if 8 <= bits <= 32 else 0)
+        except: return (False, 0)
+
+    def _mask_bits(vn):
+        ok, bits = _is_all_ones_const(vn)
+        return bits if ok else 0
+
+    def _chain_mask_bits(vn, budget=16):
+        """Walk def chain to find an INT_AND with an all-ones constant."""
+        cur, steps, best = vn, 0, 0
+        while cur and steps < budget:
+            try: defop = cur.getDef()
+            except: defop = None
+            if defop is None: break
+            opc = defop.getOpcode()
+            if opc == PcodeOp.INT_AND:
+                try:
+                    n = getattr(defop, "getNumInputs", defop.getInputCount)()
+                    for i in range(n):
+                        mb = _mask_bits(defop.getInput(i))
+                        best = max(best, mb)
+                    # continue chasing non-const input
+                    a0, a1 = defop.getInput(0), defop.getInput(1)
+                    cur = a0 if (a0 and not a0.isConstant()) else (a1 if a1 and not a1.isConstant() else None)
+                except: break
+            elif opc in (PcodeOp.INT_ADD, PcodeOp.PTRADD, PcodeOp.PTRSUB,
+                         PcodeOp.COPY, PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT):
+                try: cur = defop.getInput(0)
+                except: break
+            else:
+                break
+            steps += 1
+        return best
+
+    def _classify_value(val_vn, budget=8):
+        try:
+            if val_vn and val_vn.isConstant():
+                v = int(val_vn.getOffset()) & 0xFFFFFFFF
+                if v == 0:
+                    return "memset?"
+                # crude “code-like” heuristic: near the function, high bit clear
+                return "table-fill?" if v < 0x200000 else "const"
+        except: pass
+        cur, steps = val_vn, 0
+        while cur and steps < budget:
+            try: defop = cur.getDef()
+            except: defop = None
+            if defop is None: break
+            if defop.getOpcode() == PcodeOp.LOAD:
+                return "memcpy?"
+            if defop.getOpcode() in (PcodeOp.COPY, PcodeOp.INT_ZEXT, PcodeOp.INT_SEXT):
+                try: cur = defop.getInput(0)
+                except: break
+            else:
+                break
+            steps += 1
+        return "store"
+
+    def _addr_key(vn):
+        """Key used for fallback grouping: same base varnode identity (register/unique)."""
+        try:
+            if vn is None: return None
+            sp = vn.getSpace()
+            sid = sp.getName() if sp else "?"
+            off = vn.getOffset()
+            sz  = vn.getSize()
+            # For registers: (space="register", off=regnum)
+            return (sid, int(off), int(sz))
+        except: return None
+
+    def _dump_store(addr, op):
+        try: nin = op.getNumInputs()
+        except: nin = op.getInputCount()
+        av = op.getInput(1) if nin >= 2 else None
+        vv = op.getInput(2) if nin >= 3 else None
+        mb = _chain_mask_bits(av) if av else 0
+        try: _log("[store-shape] @%s mask=%db val_size=%s addr_v=%s val_v=%s :: %s" %
+                  (addr, mb, _vn_size(vv), av, vv, op))
+        except: pass
+
+    # Collect all pcode ops
+    ops = []
+    for bb in high_func.getBasicBlocks():
+        it = bb.getIterator()
+        while it.hasNext():
+            op = it.next()
+            try: addr = op.getSeqnum().getTarget()
+            except: addr = None
+            ops.append((addr, op))
+
+    if debug:
+        dumped = 0
+        for addr, op in ops:
+            if op.getOpcode() == PcodeOp.STORE:
+                _dump_store(addr, op)
+                dumped += 1
+                if dumped >= debug_dump_limit: break
+
+    # Primary candidates (mask-based) + fallback (same-base register)
+    mask_cands = []
+    reg_cands  = []  # (idx, addr, kind, basekey)
+
+    for idx, (addr, op) in enumerate(ops):
+        if op.getOpcode() != PcodeOp.STORE:
+            continue
+        try: nin = op.getNumInputs()
+        except: nin = op.getInputCount()
+        addr_v = op.getInput(1) if nin >= 2 else None
+        val_v  = op.getInput(2) if nin >= 3 else None
+
+        kind   = _classify_value(val_v)
+        mbits  = _chain_mask_bits(addr_v) if addr_v is not None else 0
+        basek  = _addr_key(addr_v)
+
+        if mbits >= 16:
+            mask_cands.append((idx, addr, kind, mbits))
+        elif basek is not None:
+            # fallback track by same base register/unique
+            reg_cands.append((idx, addr, kind, basek))
+
+    # Keep only mask_cands if require_20bit; else we can use both sources.
+    pools = []
+    if mask_cands and require_20bit:
+        pools.append(("20b-mask", mask_cands))
+    else:
+        if mask_cands: pools.append(("20b-mask", mask_cands))
+        if reg_cands:  pools.append(("same-base", reg_cands))
+
+    annotated_total = 0
+
+    for label, pool in pools:
+        # group runs by proximity (and by same base for the fallback pool)
+        runs, cur, prev = [], [], None
+        same_base = (label == "same-base")
+        cur_base  = None
+
+        for (idx, addr, kind, extra) in pool:
+            if not cur:
+                cur = [(idx, addr, kind, extra)]
+                prev = idx
+                cur_base = extra if same_base else None
+                continue
+            close = (idx - prev) <= gap_max
+            same  = (extra == cur_base) if same_base else True
+            if close and same:
+                cur.append((idx, addr, kind, extra))
+            else:
+                if len(cur) >= min_run:
+                    runs.append(cur)
+                cur = [(idx, addr, kind, extra)]
+                cur_base = extra if same_base else None
+            prev = idx
+        if len(cur) >= min_run:
+            runs.append(cur)
+
+        if debug:
+            _log("[store-%s] runs: %d" % (label, len(runs)))
+
+        # annotate
+        for run in runs:
+            head = run[0][1]
+            kinds = sorted(set(k for (_, _, k, _) in run))
+            if label == "20b-mask":
+                max_mb = max((mb for (_, _, _, mb) in run), default=0)
+                tag = "EA %db" % max_mb if max_mb else "EA ?"
+            else:
+                tag = "same-base"
+            summary = "Dirty430: %s x%d (%s)" % ("/".join(kinds), len(run), tag)
+            if _append_eol_comment_at(head, summary):
+                annotated_total += 1
+            for (_, a, k, _) in run:
+                _append_eol_comment_at(a, "Dirty430: %s" % k)
+
+    if debug:
+        _log("[store-relaxed] runs annotated: %d" % annotated_total)
+    return annotated_total
+
 
 def _append_eol_comment(addr, text):
     """Append (or set) an EOL comment at addr."""
@@ -892,183 +1118,7 @@ def add_comment_on_first_c_statement(func, text="Dirty430 TEST: first C stmt"):
         _log("[test] add_comment_on_first_c_statement failed: %s" % e, "warn", always=True)
         return False
 
-def memcpy_annotate(high_func, tokens, min_stores=2, lookahead=160, relax_no_adv=True, debug=False, dump_limit=30):
-    """
-    Detect memcpy-like bursts that copy 16-bit words into a destination formed with MSP430X
-    20-bit wrapping. Much looser matching, and will annotate dense STORE runs even if no
-    '& 0xFFFFF' advance is found when relax_no_adv=True.
 
-    Adds EOL comments on each STORE in the run and a summary on the first line.
-    Returns: number of STORE lines annotated.
-    """
-    import re
-    from ghidra.app.decompiler import DecompInterface
-    from ghidra.util.task import ConsoleTaskMonitor
-    from ghidra.program.model.listing import CodeUnit
-
-    # --- helpers ---
-    def _flatten_groups(root):
-        try:
-            from ghidra.app.decompiler import ClangTokenGroup
-        except Exception:
-            try:
-                from ghidra.app.decompiler.clang import ClangTokenGroup
-            except Exception:
-                ClangTokenGroup = None
-        out = []
-        if root is None or ClangTokenGroup is None:
-            return out
-        st = [root]
-        while st:
-            g = st.pop()
-            if isinstance(g, ClangTokenGroup):
-                try:
-                    parts = []
-                    for i in range(g.numChildren()):
-                        parts.append(str(g.Child(i)))
-                    txt = "".join(parts)
-                except Exception:
-                    txt = str(g)
-                try:
-                    a = g.getMinAddress()
-                except Exception:
-                    a = None
-                out.append((txt, a))
-                for i in range(g.numChildren() - 1, -1, -1):
-                    st.append(g.Child(i))
-        return out
-
-    def _norm_stmt(s):
-        s = s.strip()
-        while True:
-            changed = False
-            if s.startswith("do {"):
-                s = s[3:].lstrip(); changed = True
-            if s.startswith("{"):
-                s = s[1:].lstrip(); changed = True
-            if s.endswith("}"):
-                s = s[:-1].rstrip(); changed = True
-            if not changed:
-                break
-        return s
-
-    def _append_eol(addr, text):
-        prog = PROGRAM or currentProgram
-        if prog is None or addr is None:
-            return False
-        try:
-            listing = prog.getListing()
-            cu = listing.getCodeUnitAt(addr)
-            if cu is None:
-                try: disassemble(addr)
-                except Exception: pass
-                cu = listing.getCodeUnitAt(addr)
-            if cu is None:
-                return False
-            old = cu.getComment(CodeUnit.EOL_COMMENT)
-            cu.setComment(CodeUnit.EOL_COMMENT, (old + " | " + text) if old else text)
-            return True
-        except Exception:
-            return False
-
-    def _bm(addr, cat, msg):
-        try:
-            createBookmark(addr, cat, msg)
-        except Exception:
-            pass
-
-    # --- re-decompile to align token groups with addresses ---
-    ifc = DecompInterface()
-    ifc.openProgram(PROGRAM or currentProgram)
-    dr = ifc.decompileFunction(high_func.getFunction(), 60, ConsoleTaskMonitor())
-    if not dr or not dr.decompileCompleted():
-        _log("[memcpy20R] decompile failed; pass skipped", "warn")
-        return 0
-
-    # break groups into pseudo-statements (keeps address of the group)
-    items = []
-    for txt, a in _flatten_groups(dr.getCCodeMarkup()):
-        for part in txt.split(';'):
-            p = part.strip()
-            if not p:
-                continue
-            items.append((_norm_stmt(p) + ';', a))
-
-    # relaxed STORE matcher
-    RE_STORE = re.compile(r"""
-        ^\*\s*\(\s*(?:undefined2|u?short|uint16_t)\s*\*\s*\)\s*
-        \([^=]*?
-            (?P<dst>\w+)
-            (?:\s*[+\-]\s*\d+[Uu]?)?
-            [^=]*?&\s*0x[fF]{4}\s*
-        \)\s*=\s*
-        \*\s*\(\s*(?:undefined2|u?short|uint16_t)\s*\*\s*\)\s*
-        \([^=]*?
-            (?P<src>\w+)
-            (?:\s*\+\s*(?P<off>0x[0-9A-Fa-f]+|\d+))?
-            [^=]*?&\s*0x[fF]{4}\s*
-        \)\s*;$
-    """, re.X)
-
-    # any sign of 20-bit wrap counts as ADV evidence
-    RE_ANY_20BIT = re.compile(r"&\s*0x[fF]{5}")
-
-    # gather (stmt, addr, m) where m is STORE match
-    stmts = []
-    for t, a in items:
-        s = t[:-1].strip()
-        m = RE_STORE.match(s)
-        if m:
-            stmts.append((s, a, m))
-
-    if debug:
-        _log("[memcpy20R] STORE candidates: %d" % len(stmts))
-
-    annotated = 0
-    used = set()  # indices consumed in a run
-    for i in range(len(stmts)):
-        if i in used:
-            continue
-        s0, a0, m0 = stmts[i]
-        dst = m0.group('dst')
-        src = m0.group('src')
-
-        # scan forward within lookahead window to build run
-        run = [i]
-        any_adv = False
-        j = i + 1
-        steps = 0
-        while j < len(items) and steps < lookahead:
-            line, addr = items[j]
-            core = line[:-1].strip()
-            # collect next matching store to same dst/src
-            if j < len(stmts) and stmts[j][1] == addr:
-                sX, aX, mX = stmts[j]
-                if mX.group('dst') == dst and mX.group('src') == src:
-                    run.append(j)
-            # ADV evidence anywhere in the window
-            if RE_ANY_20BIT.search(core):
-                any_adv = True
-            j += 1; steps += 1
-
-        if len(run) >= min_stores and (any_adv or relax_no_adv):
-            # annotate the run
-            head_addr = stmts[run[0]][1]
-            summary = "Dirty430: memcpy16_20bit(dst=%s, src=%s, words~%d)%s" % (
-                dst, src, len(run), "" if any_adv else " [no-adv]"
-            )
-            _append_eol(head_addr, summary)
-            _bm(head_addr, "Dirty430", "memcpy16_20bit x%d" % len(run))
-            annotated += 1
-            # tag each store in the run for visibility
-            for k in run:
-                _append_eol(stmts[k][1], "Dirty430: memcpy run")
-                used.add(k)
-
-    if debug:
-        _log("[memcpy20R] runs annotated: %d" % annotated)
-
-    return annotated
 
 
 
@@ -1082,15 +1132,23 @@ def clean_function(func):
         _log("decomp: failed %s" % func.getName(), 'warn', always=True)
         return
 
-    add_test_comment_on_entry(func, eol_text="Dirty430 TEST: entry", plate_text="Dirty430: test plate")
-    add_comment_on_first_c_statement(func, text="Dirty430 TEST: first C stmt")
 
     simplify_arithmetic(high_func, tokens)
     bitmask_macros(high_func, tokens)
     constant_folding(high_func, tokens)
     switch_table_hint(high_func, tokens)
     struct_recovery(high_func, tokens)
-    memcpy_annotate(high_func, tokens, min_stores=2, lookahead=300, relax_no_adv=True, debug=True)
+
+    annotate_store16_msp430x20_runs_all_in_one(
+        high_func,
+        min_run=2,
+        gap_max=8,
+        require_20bit=False,  
+        debug=True,
+        debug_dump_limit=80
+    )
+
+
     memset_replace(high_func, tokens)
     pass_resume_points(high_func, tokens)
 
