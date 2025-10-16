@@ -678,7 +678,7 @@ def _comment_text_for_bits(bits_dict):
 # Set FORCE_OVERWRITE = True to allow the script to clear existing data/instructions
 # in target regions before redefining them. Use with
 # caution. You could screw up analysis Ghidra did already.
-FORCE_OVERWRITE = True
+FORCE_OVERWRITE = False
 
 # Verbose logging toggle: when True, log every skip/decision; when False, only key actions.
 VERBOSE = True
