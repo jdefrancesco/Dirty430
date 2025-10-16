@@ -20,40 +20,6 @@ def block_overlaps(start, end):
             return True
     return False
 
-# def make_block(name, start, end, perms="r", space=None):
-#     mem = currentProgram.getMemory()
-#     size = end.subtract(start) + 1
-#     af = currentProgram.getAddressFactory()
-    
-#     # accept either Address or hex string
-#     if isinstance(start, basestring):
-#         start_addr = af.getAddress(start) if space is None else af.getAddress(space + ":" + start)
-#     else:
-#         start_addr = start
-
-#     if isinstance(end, basestring):
-#         end_addr = af.getAddress(end) if space is None else af.getAddress(space + ":" + end)
-#     else:
-#         end_addr = end
-
-
-#     if block_overlaps(start, end):
-#         print("[=] Skipping overlap region {0}: {1}-{2}".format(name, start, end))
-#         return None
-
-#     try:
-#         block = mem.createUninitializedBlock(name, start, size, False)
-#         read = 'r' in perms
-#         write = 'w' in perms
-#         execute = 'x' in perms
-#         block.setPermissions(read, write, execute)
-#         print("[+] Created {0:<12} {1}-{2} ({3} bytes) perms={4}".format(name, start, end, size, perms))
-#         return block
-#     except MemoryConflictException:
-#         print("[=] Overlap detected, skipping {0}".format(name))
-#     except Exception as e:
-#         print("[!] Error creating {0}: {1}".format(name, str(e)))
-#     return None
 
 
 def make_block(name, start, end, perms="r", space=None):

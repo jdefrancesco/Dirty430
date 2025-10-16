@@ -26,6 +26,7 @@ from ghidra.program.model.pcode import PcodeOp
 from ghidra.util.task import ConsoleTaskMonitor
 from ghidra.program.model.listing import CodeUnit
 
+from ghidra.program.model.mem import MemoryAccessException
 
 # Different builds keep it either in clang or decompiler package...
 try:
@@ -390,219 +391,6 @@ def memset_replace(high_func, tokens):
     _log("[memset] Done")
     return
 
-
-    """
-    Detect memcpy-like bursts that copy 16-bit words into a 20-bit wrapped dest:
-      STORE:  *(uint16_t*)((long)(int3)IDX - 2U? & 0xffff) = *(uint16_t*)((ulong)(SRC [+ k]) & 0xffff);
-    with nearby evidence of 20-bit advancement of IDX via some BASE (often unaff_R3):
-      ADV:    IDX = BASE + IDX & 0xfffff;
-              IDX = BASE + (int3)PTR & 0xfffff;
-              PTR = (T*)(long)(int3)(BASE + IDX & 0xfffff);
-    We don't require strict STORE/ADV alternation: we just count STOREs and confirm at least
-    one ADV for the same IDX within a sliding window.
-
-    Writes a summary EOL comment on the first STORE and short tags on following lines.
-    """
-
-    from ghidra.app.decompiler import DecompInterface
-    from ghidra.util.task import ConsoleTaskMonitor
-    from ghidra.program.model.listing import CodeUnit
-    import re
-
-    # --- helpers ---
-    def _flatten_groups(root):
-        try:
-            from ghidra.app.decompiler import ClangTokenGroup
-        except Exception:
-            try:
-                from ghidra.app.decompiler.clang import ClangTokenGroup
-            except Exception:
-                ClangTokenGroup = None
-        out = []
-        if root is None or ClangTokenGroup is None:
-            return out
-        st = [root]
-        while st:
-            g = st.pop()
-            if isinstance(g, ClangTokenGroup):
-                try:
-                    parts = []
-                    for i in range(g.numChildren()):
-                        parts.append(str(g.Child(i)))
-                    txt = "".join(parts)
-                except Exception:
-                    txt = str(g)
-                try:
-                    a = g.getMinAddress()
-                except Exception:
-                    a = None
-                out.append((txt, a))
-                for i in range(g.numChildren()-1, -1, -1):
-                    st.append(g.Child(i))
-        return out
-
-    def _norm_stmt(s):
-        # normalize whitespace, strip noisy do-block braces/prefixes
-        s = s.strip()
-        if s.startswith("do {"):
-            s = s[3:].strip()
-        if s.endswith("}"):
-            s = s[:-1].strip()
-        return s
-
-    def _add_eol(addr, text):
-        if addr is None:
-            return
-        try:
-            listing = (PROGRAM or currentProgram).getListing()
-            cu = listing.getCodeUnitAt(addr)
-            if cu is None:
-                return
-            old = cu.getComment(CodeUnit.EOL_COMMENT)
-            if old:
-                if text in old:
-                    return
-                cu.setComment(CodeUnit.EOL_COMMENT, old + " | " + text)
-            else:
-                cu.setComment(CodeUnit.EOL_COMMENT, text)
-        except Exception:
-            pass
-
-    def _bm(addr, cat, msg):
-        try: createBookmark(addr, cat, msg)
-        except: pass
-
-    # --- fresh decompile snapshot ---
-    ifc = DecompInterface()
-    ifc.openProgram(PROGRAM or currentProgram)
-    func = high_func.getFunction()
-    dr = ifc.decompileFunction(func, 60, ConsoleTaskMonitor())
-    if not dr or not dr.decompileCompleted():
-        _log("[memcpy20R] decompile failed; pass skipped", "warn")
-        return 0
-
-    # split groups into semi-statements
-    items = []
-    for txt, a in _flatten_groups(dr.getCCodeMarkup()):
-        for p in txt.split(';'):
-            p = p.strip()
-            if p:
-                items.append((_norm_stmt(p) + ';', a))
-
-    # --- regexes (loose) ---
-    # 16-bit copy store into (int3)IDX - 2 ... & 0xffff
-    RE_STORE = re.compile(r"""
-        ^\*\s*\(\s*(?:undefined2|u?short|uint16_t)\s*\*\s*\)\s*
-        \(\s*(?:long\s*\)\s*)?(?:\(?\s*int3\s*\)?\s*)?
-        (?P<idx>\w+)\s*(?:[-+]\s*0*2[Uu]?)?\s*[^)]*?&\s*0x[fF]{4}\s*\)\s*=\s*
-        \*\s*\(\s*(?:undefined2|u?short|uint16_t)\s*\*\s*\)\s*
-        \(\s*(?:u?long|u?int32_t|ulong)\s*\)\s*
-        \(\s*(?P<src>\w+)(?:\s*\+\s*(?P<off>0x[0-9A-Fa-f]+|\d+))?\s*\)\s*&\s*0x[fF]{4}\s*;$
-    """, re.X)
-
-    # Any evidence of 20-bit advancement for the same idx
-    RE_ADV_A = re.compile(r"""^(?P<idx>\w+)\s*=\s*(?P<base>\w+)\s*\+\s*(?P=idx)\s*&\s*0x[fF]{5}\s*;$""")
-    RE_ADV_B = re.compile(r"""^(?P<idx>\w+)\s*=\s*(?P<base>\w+)\s*\+\s*\(\s*int3\s*\)\s*\w+\s*&\s*0x[fF]{5}\s*;$""")
-    RE_ADV_C = re.compile(r"""^\w+\s*=\s*\(.*\)\s*\(\s*long\s*\)\s*\(\s*int3\s*\)\s*\(\s*(?P<base>\w+)\s*\+\s*(?P<idx>\w+)\s*&\s*0x[fF]{5}\s*\)\s*;$""")
-
-    # Debug capture
-    dbg_store_like, dbg_adv_like = [], []
-
-    # --- scan & group runs by destination idx ---
-    n = len(items)
-    used = [False] * n
-    annotated_pairs = 0
-
-    i = 0
-    while i < n:
-        t, a = items[i]
-        m = RE_STORE.match(t[:-1].strip())
-        if not m:
-            # near-miss debug
-            if "*(" in t and "& 0x" in t and "= *(" in t:
-                if len(dbg_store_like) < dump_limit:
-                    dbg_store_like.append((a, t))
-            i += 1
-            continue
-
-        idx = m.group("idx")
-        src = m.group("src")
-
-        # look ahead to collect more STOREs that keep same idx (allow interleaved noise)
-        run_idxs = [i]
-        j = i + 1
-        adv_seen = False
-        base_seen = None
-
-        steps = 0
-        while j < n and steps < lookahead:
-            tt, aa = items[j]
-            s = tt[:-1].strip()
-
-            # more stores?
-            mm = RE_STORE.match(s)
-            if mm and mm.group("idx") == idx and mm.group("src") == src:
-                run_idxs.append(j)
-
-            # any adv forms?
-            ma = RE_ADV_A.match(s)
-            mb = RE_ADV_B.match(s)
-            mc = RE_ADV_C.match(s)
-            if ma and ma.group("idx") == idx:
-                adv_seen = True
-                base_seen = base_seen or ma.group("base")
-            elif mb and re.search(r"\b" + re.escape(idx) + r"\b", s):
-                adv_seen = True
-                base_seen = base_seen or mb.group("base")
-            elif mc and mc.group("idx") == idx:
-                adv_seen = True
-                base_seen = base_seen or mc.group("base")
-
-            j += 1
-            steps += 1
-
-        # Only annotate if enough stores and we saw 20-bit advance for this idx
-        store_count = len(run_idxs)
-        if store_count >= min_stores and adv_seen:
-            head_addr = items[run_idxs[0]][1]
-            summary = "Dirty430: memcpy16_20bit(dst=%s, src=%s, words=%d)%s" % (
-                idx, src, store_count, (" via %s" % base_seen) if base_seen else ""
-            )
-            _add_eol(head_addr, summary)
-            _bm(head_addr, "Dirty430", "memcpy16_20bit x%d" % store_count)
-
-            # short tags on each store in the run
-            for k in run_idxs[1:]:
-                _add_eol(items[k][1], "Dirty430: memcpy run")
-            annotated_pairs += store_count
-
-            # skip past this window to avoid duplicate annotations
-            i = run_idxs[-1] + 1
-        else:
-            # debug ADV-like
-            if not adv_seen and debug:
-                # collect a few ADV-like strings around here
-                for w in range(i, min(n, i + 10)):
-                    ss, aa = items[w]
-                    if "& 0x" in ss and "+" in ss and ("0xfffff" in ss or "int3" in ss):
-                        if len(dbg_adv_like) < dump_limit:
-                            dbg_adv_like.append((aa, ss))
-            i += 1
-
-    if debug:
-        _log("[memcpy20R] stores annotated: %d" % annotated_pairs)
-        if dbg_store_like:
-            _log("[memcpy20R][debug] STORE-like (first %d):" % len(dbg_store_like))
-            for a, line in dbg_store_like:
-                off = ("0x%X" % a.getOffset()) if a else "<?>"
-                _log("  %s :: %s" % (off, line))
-        if dbg_adv_like:
-            _log("[memcpy20R][debug] ADV-like (first %d):" % len(dbg_adv_like))
-            for a, line in dbg_adv_like:
-                off = ("0x%X" % a.getOffset()) if a else "<?>"
-                _log("  %s :: %s" % (off, line))
-
-    return annotated_pairs
 
 
 
@@ -1120,7 +908,64 @@ def add_comment_on_first_c_statement(func, text="Dirty430 TEST: first C stmt"):
 
 
 
+# AES S-box (standard)
+SBOX = [
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
+]
 
+from ghidra.program.model.address import Address
+from ghidra.util.task import TaskMonitor
+
+def find_bytes(prog, byte_list):
+    mem = prog.getMemory()
+    start = mem.getMinAddress()
+    maxFound = 0
+    results = []
+    # naive sliding scan: search for first byte occurrences then verify rest
+    first = byte_list[0]
+    cur = start
+    while cur is not None and cur <= mem.getMaxAddress():
+        try:
+            b = mem.getByte(cur)
+        except MemoryAccessException:
+            cur = cur.next()
+            continue
+        if (b & 0xff) == first:
+            # verify sequence
+            ok = True
+            addr = cur
+            for i in xrange(len(byte_list)):
+                a = addr.add(i)
+                try:
+                    mb = mem.getByte(a) & 0xff
+                except MemoryAccessException:
+                    ok = False
+                    break
+                if mb != byte_list[i]:
+                    ok = False
+                    break
+            if ok:
+                results.append(cur)
+                # skip ahead
+                cur = cur.add(len(byte_list))
+                continue
+        cur = cur.next()
+    return results
 
 def clean_function(func):
     """Cleans up a single function's decompiled output."""
@@ -1164,6 +1009,20 @@ def run_current():
         _log("[D430]: No function at current address.", 'warn', always=True)
         return
     clean_function(func)
+
+    _log("[!] Find Potential AES")
+    addresses = find_bytes(currentProgram, SBOX)
+    if not addresses:
+        print("No S-box occurrences found.")
+    else:
+        for i,addr in enumerate(addresses):
+            name = "AES_SBOX_" + str(i)
+            try:
+                createLabel(addr, name, True)
+                createData(addr, ghidra.program.model.data.ByteDataType.getDataType(), len(SBOX))
+            except Exception as e:
+                print("label/data create failed at %s: %s" % (addr, str(e)))
+            print("Found S-box at: %s (labeled %s)" % (addr, name))
 
 
 def run_all():
