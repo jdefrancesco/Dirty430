@@ -10,7 +10,8 @@ The plugin has two simple phases:
     It also identifies and marks the interrupt service routines (ISRs) associated with the vectors in the table.
 2. **Cleanup Phase**: This simply marks memory mapped registers (MMRs) and other special function registers (SFRs) in the disassembly.
 
-**NOTE:** This plugin is hardcoded for the `MSP430f5438` microcontroller. However, it can be easily adapted to other `MSP430` variants by modifying the relevant parameters in the code.
+**NOTE:** This plugin is hardcoded for the `MSP430f5438` microcontroller. However, it c:wa
+an be easily adapted to other `MSP430` variants by modifying the relevant parameters in the code.
 
 The following sources can be references: <ADD TOOLKIT LINK>
 
