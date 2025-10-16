@@ -13,7 +13,6 @@ The plugin has two simple phases:
 **NOTE:** This plugin is hardcoded for the `MSP430f5438` microcontroller. However, it c:wa
 an be easily adapted to other `MSP430` variants by modifying the relevant parameters in the code.
 
-The following sources can be references: <ADD TOOLKIT LINK>
 
 ## Post Decompile Phase Optimizations.
 
@@ -22,10 +21,14 @@ NOTE: Developed in seperate module for now. Heavily adapted from one of my old I
 The cleaning of Decompiled code can go a long way for the `MSP430`:
 We attempt to apply the following to decompilation output:
 
-  - MUL/DIV SimplIfications (No hardware support on msp430s)
-  - Bitmask macro cleanup
+  - Bitmask macro 
   - Switch recovery
   - Struct detection
   - Constant folding
 
 
+## FindCrypt
+
+Use FindCrypt Ghidra plugin on github if available. This is a 
+small Python script to look for crypto primitives in case FindCrypt doesn't want to behave. 
+Will add more ciphers/constant heuristics eventually.
