@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # DirtyMemBlockRename.py 
 # MSP430F5438 Memory Block Renamer
 # Automatically renames memory blocks based on known MSP430F5438 address ranges.
