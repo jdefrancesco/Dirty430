@@ -1,199 +1,229 @@
+# -*- coding: utf-8 -*-
 # DirtyFindCrypto.py
-# 
-# Search MSP430 Firmware for potential crypto functions.
-# 
-# Detects:
-#  AES S-box, Inv S-box, Rcon
-#  SHA1 H, SHA256 K, MD5 T
-#  TEA delta clusters
-#  Large opaque byte blocks (>=176 or >=1024 bytes)
+#
+# Fast crypto constant finder for Ghidra (MSP430, embedded firmware, etc.)
+# FIXED: bytearray -> Java signed byte[] conversion (no more OverflowError!)
+#
+# Usage: Run inside Ghidra (Script Manager). Labels, bookmarks, and comments are auto-added.
+# Optional CSV export can be enabled below.
+#
+# Author: J. DeFrancesco (improved by ChatGPT)
 
-#@author J. DeFrancesco
-#@category Crypto
+
+EXPORT_CSV = False
+CSV_FILENAME = "DirtyFindCrypto_hits.csv"
+COMMENT_PREFIX = "[Dirty430 CryptoFinder]"
+LABEL_FORCE_PRIMARY = True
+
 
 try:
     from ghidra.program.model.mem import MemoryAccessException
     from ghidra.program.model.data import ByteDataType, DWordDataType, ArrayDataType
     from ghidra.util.task import TaskMonitor
+    from ghidra.program.flatapi import FlatProgramAPI
+    import jarray
 except:
-    print("Failed to import ghidra headers. Continuing for debug mode.")
+    print("Warning: Ghidra imports failed. This script must run in Ghidra.")
     pass
 
-def bytes_from_list(lst): return ''.join([chr(x & 0xff) for x in lst])
 
-def uint32_to_le_bytes(v): return chr(v & 0xff) + chr((v>>8)&0xff) + chr((v>>16)&0xff) + chr((v>>24)&0xff)
 
-def dwords_to_bytes_le(dlist):
-    """Convert list of dwords to LE"""
+def bytes_from_list_u8(lst):
+    return bytearray([x & 0xff for x in lst])
 
-    out = []
+def u32_le_bytes(v):
+    v = v & 0xffffffff
+    return bytearray([v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff, (v >> 24) & 0xff])
+
+def dwords_to_le_bytes(dlist):
+    out = bytearray()
     for v in dlist:
-        out.append(chr(v & 0xff))
-        out.append(chr((v >> 8) & 0xff))
-        out.append(chr((v >> 16) & 0xff))
-        out.append(chr((v >> 24) & 0xff))
-    return ''.join(out)
+        out.extend(u32_le_bytes(v))
+    return out
 
+def fmt_addr(addr):
+    try: return str(addr)
+    except: return "<addr>"
 
-def to_hex(b):
-    """Print as string for debug."""
-    return ' '.join(["%02X" % (ord(x) & 0xFF) for x in b])
+def define_array_at(addr, total_len_bytes, dtype):
+    try:
+        elem_len = dtype.getLength()
+        if elem_len <= 0:
+            return False
+        count = max(1, total_len_bytes // elem_len)
+        arr = ArrayDataType(dtype, count, elem_len)
+        createData(addr, arr)
+        return True
+    except:
+        return False
 
+def add_crypto_bookmark(addr, short_text, long_text=None):
+    try:
+        createBookmark(addr, "Info", "CRYPTO", short_text)
+    except:
+        pass
+    try:
+        if long_text:
+            setPlateComment(addr, long_text)
+        else:
+            setPlateComment(addr, short_text)
+    except:
+        pass
+
+def make_label(addr, label):
+    try:
+        createLabel(addr, label, LABEL_FORCE_PRIMARY)
+    except:
+        try:
+            createLabel(addr, label, False)
+        except:
+            pass
+
+#
 
 class CryptoFinder(object):
     def __init__(self, program):
         self.prog = program
+        self.api = FlatProgramAPI(program)
         self.mem = program.getMemory()
         self.minA = self.mem.getMinAddress()
         self.maxA = self.mem.getMaxAddress()
         self.report = []
 
-    def read_byte(self, addr):
-        try:
-            return self.mem.getByte(addr) & 0xff
-        except MemoryAccessException:
-            return None
+    def _to_java_bytes(self, py_bytes):
+        """Convert Python bytes/bytearray/list → Java signed byte[] (-128..127)"""
+        if isinstance(py_bytes, basestring):
+            seq = [ord(c) & 0xff for c in py_bytes]
+        else:
+            seq = [int(x) & 0xff for x in py_bytes]
+        signed = [b if b < 0x80 else b - 0x100 for b in seq]
+        return jarray.array(signed, 'b')
 
-    def read_chunk(self, addr, n):
-        try:
-            return self.mem.getBytes(addr, n)
-        except MemoryAccessException:
-            return None
-
-    def find_sequence(self, seq_bytes):
-        results = []
-        s0 = ord(seq_bytes[0])
-        addr = self.minA
-        while addr and addr <= self.maxA:
-            b = self.read_byte(addr)
-            if b is None:
-                addr = addr.next()
-                continue
-            if b == s0:
-                chunk = self.read_chunk(addr, len(seq_bytes))
-                if chunk == seq_bytes:
-                    results.append(addr)
-                    addr = addr.add(len(seq_bytes))
-                    continue
-            addr = addr.next()
-        return results
-
-    
-    def label_and_define(self, addr, label, length, dtype):
-        try:
-            createLabel(addr, label, True)
-        except Exception:
+    def _find_all(self, seq_bytes):
+        """Use Ghidra Memory.findBytes() with Java byte[] pattern."""
+        pattern = self._to_java_bytes(seq_bytes)
+        start = self.minA
+        while True:
+            hit = self.mem.findBytes(start, self.maxA, pattern, None, True, TaskMonitor.DUMMY)
+            if hit is None:
+                break
+            yield hit
             try:
-                createLabel(addr, label, False)
-            except Exception:
-                pass
-        try:
-            arr = ArrayDataType(dtype, length, dtype.getLength())
-            createData(addr, arr)
-        except Exception:
-            pass
-        self.report.append((label, addr))
+                start = hit.add(1)
+            except:
+                break
 
-    # large block heuristic
+    def scan_and_label(self, seq_bytes, label_prefix, dtype, define_len=None, describe=None):
+        hits = 0
+        tlen = define_len if define_len is not None else len(seq_bytes)
+        for i, addr in enumerate(self._find_all(seq_bytes)):
+            label = "%s_%d" % (label_prefix, i)
+            make_label(addr, label)
+            define_array_at(addr, tlen, dtype)
+            short = "%s %s @ %s" % (COMMENT_PREFIX, label_prefix, fmt_addr(addr))
+            long = "%s found %s\nlen=%d bytes" % (COMMENT_PREFIX, label_prefix, tlen)
+            if describe:
+                long += "\n" + describe
+            add_crypto_bookmark(addr, short, long)
+            self.report.append((label, addr))
+            hits += 1
+        return hits
+
     def find_large_blocks(self, min_size):
         blocks = []
         addr = self.minA
         in_block = False
         block_start = None
         block_len = 0
+
         while addr and addr <= self.maxA:
-            b = self.read_byte(addr)
-            if b is None:
+            try:
+                self.mem.getByte(addr)
+                readable = True
+            except MemoryAccessException:
+                readable = False
+
+            if not readable:
                 if in_block and block_len >= min_size:
                     blocks.append((block_start, block_len))
                 in_block = False
                 block_start = None
                 block_len = 0
-                addr = addr.next()
-                continue
-            if not in_block:
-                in_block = True
-                block_start = addr
-                block_len = 1
             else:
-                block_len += 1
+                if not in_block:
+                    in_block = True
+                    block_start = addr
+                    block_len = 1
+                else:
+                    block_len += 1
+
             if addr.equals(self.maxA):
                 if in_block and block_len >= min_size:
                     blocks.append((block_start, block_len))
                 break
             addr = addr.next()
+
         return blocks
 
-    def scan_and_label(self, seq_bytes, label_prefix, dtype, define_len=None):
-        found = self.find_sequence(seq_bytes)
-        for i,addr in enumerate(found):
-            lbl = "%s_%d" % (label_prefix, i)
-            self.label_and_define(addr, lbl, define_len or len(seq_bytes), dtype)
-        return len(found)
+
 
 def main():
-    """Main function"""
-    
-    print("=== [D430 CryptoFinder] scanning program for cryptographic constants ===")
+    print("=== [D430 CryptoFinder] ===")
     cf = CryptoFinder(currentProgram)
 
-    # AES Constants
-    AES_SBOX = [0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76]
-    # Truncatedd for brevity...  should be good enough...
-    AES_SBOX += [0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0]*8  
+    AES_SBOX = [
+        0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76
+    ] + [0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0]*8
 
     AES_INV_SBOX = [0x52,0x09,0x6A,0xD5,0x30,0x36,0xA5,0x38]*32
     AES_RCON = [0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1B,0x36]
     SHA1_H = [0x67452301,0xEFCDAB89,0x98BADCFE,0x10325476,0xC3D2E1F0]
     SHA256_K = [0x428A2F98,0x71374491,0xB5C0FBCF,0xE9B5DBA5]
     MD5_T = [0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee]
-    CHACHA = [0x61707865,0x3320646E,0x79622D32,0x6B206574]
     BLOWP = [0x243F6A88,0x85A308D3,0x13198A2E,0x03707344]
-    CURVE = chr(0x09) + ("\x00"*31)
-    TEA_DELTA = uint32_to_le_bytes(0x9E3779B9)
+    TEA_DELTA = u32_le_bytes(0x9E3779B9)
 
-    AES_SBOX_B = bytes_from_list(AES_SBOX)
-    AES_INV_SBOX_B = bytes_from_list(AES_INV_SBOX)
-    AES_RCON_B = bytes_from_list(AES_RCON)
-    SHA1_H_B = dwords_to_bytes_le(SHA1_H)
-    SHA256_K_B = dwords_to_bytes_le(SHA256_K)
-    MD5_T_B = dwords_to_bytes_le(MD5_T)
-    BLOWP_B = dwords_to_bytes_le(BLOWP)
+    AES_SBOX_B     = bytes_from_list_u8(AES_SBOX)
+    AES_INV_SBOX_B = bytes_from_list_u8(AES_INV_SBOX)
+    AES_RCON_B     = bytes_from_list_u8(AES_RCON)
+    SHA1_H_B       = dwords_to_le_bytes(SHA1_H)
+    SHA256_K_B     = dwords_to_le_bytes(SHA256_K)
+    MD5_T_B        = dwords_to_le_bytes(MD5_T)
+    BLOWP_B        = dwords_to_le_bytes(BLOWP)
 
-    # Search for our crypto looking stuff
-    hits = 0
-    hits += cf.scan_and_label(AES_SBOX_B, "CRYPTO_AES_SBOX", ByteDataType(), len(AES_SBOX_B))
+    hits  = cf.scan_and_label(AES_SBOX_B,     "CRYPTO_AES_SBOX",     ByteDataType(), len(AES_SBOX_B))
     hits += cf.scan_and_label(AES_INV_SBOX_B, "CRYPTO_AES_INV_SBOX", ByteDataType(), len(AES_INV_SBOX_B))
-    hits += cf.scan_and_label(AES_RCON_B, "CRYPTO_AES_RCON", ByteDataType(), len(AES_RCON))
-    hits += cf.scan_and_label(SHA1_H_B, "CRYPTO_SHA1_H", DWordDataType(), len(SHA1_H)*4)
-    hits += cf.scan_and_label(SHA256_K_B, "CRYPTO_SHA256_K", DWordDataType(), len(SHA256_K)*4)
-    hits += cf.scan_and_label(MD5_T_B, "CRYPTO_MD5_T", DWordDataType(), len(MD5_T)*4)
-    hits += cf.scan_and_label(BLOWP_B, "CRYPTO_BLOWFISH_P", DWordDataType(), len(BLOWP)*4)
+    hits += cf.scan_and_label(AES_RCON_B,     "CRYPTO_AES_RCON",     ByteDataType(), len(AES_RCON))
+    hits += cf.scan_and_label(SHA1_H_B,       "CRYPTO_SHA1_H",       DWordDataType(), len(SHA1_H)*4)
+    hits += cf.scan_and_label(SHA256_K_B,     "CRYPTO_SHA256_K",     DWordDataType(), len(SHA256_K)*4)
+    hits += cf.scan_and_label(MD5_T_B,        "CRYPTO_MD5_T",        DWordDataType(), len(MD5_T)*4)
+    hits += cf.scan_and_label(BLOWP_B,        "CRYPTO_BLOWFISH_P",   DWordDataType(), len(BLOWP)*4)
 
-    # TEA clusters
-    tea_hits = cf.find_sequence(TEA_DELTA)
-    if tea_hits:
-        for i,a in enumerate(tea_hits):
-            cf.label_and_define(a, "CRYPTO_TEA_DELTA_%d" % i, 4, DWordDataType())
-        print("[+] TEA delta: %d hits" % len(tea_hits))
-        hits += len(tea_hits)
+    tea_hits = list(cf._find_all(TEA_DELTA))
+    for i, a in enumerate(tea_hits):
+        lbl = "CRYPTO_TEA_DELTA_%d" % i
+        make_label(a, lbl)
+        define_array_at(a, 4, DWordDataType())
+        add_crypto_bookmark(a, COMMENT_PREFIX + " TEA_DELTA", "TEA delta constant")
+        cf.report.append((lbl, a))
 
-    # large opaque blocks
-    big_blocks = cf.find_large_blocks(176)
-    for i,(addr,size) in enumerate(big_blocks):
+    blocks = cf.find_large_blocks(176)
+    for i,(addr,size) in enumerate(blocks):
         if size >= 1024:
-            cf.label_and_define(addr, "POTENTIAL_AES_TTABLE_%d_%dB" % (i,size), min(size,4096), ByteDataType())
-        elif size < 4096:
-            cf.label_and_define(addr, "CRYPTO_LARGE_BLOCK_%d_%dB" % (i,size), min(size,1024), ByteDataType())
+            lbl = "POTENTIAL_AES_TTABLE_%d_%dB" % (i,size)
+            make_label(addr,lbl)
+            define_array_at(addr, min(size,4096), ByteDataType())
+            cf.report.append((lbl,addr))
+        else:
+            lbl = "CRYPTO_LARGE_BLOCK_%d_%dB" % (i,size)
+            make_label(addr,lbl)
+            define_array_at(addr, min(size,1024), ByteDataType())
+            cf.report.append((lbl,addr))
 
-    print("\n=== [D430 CryptoFinder] results ===")
-    for lbl,addr in cf.report:
-        print("  %-35s  @ %s" % (lbl, addr))
-    print("Total labels created: %d" % len(cf.report))
-    if not cf.report:
-        print("[!] No known crypto constants detected.")
-    else:
-        print("[*] Check out X-refs to labels!")
+    print("\n=== Results ===")
+    for lbl, addr in cf.report:
+        print("  %-35s @ %s" % (lbl, fmt_addr(addr)))
+    print("Total labels: ", len(cf.report))
 
 if __name__ == "__main__":
     main()
