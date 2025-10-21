@@ -18,6 +18,8 @@ from java.io import File, FileOutputStream
 import os, time
 
 
+EXPORT_DIR = os.path.expanduser("~/Desktop/ghidra_exports")
+
 # USCI registers (F5438)
 USCI_REGS = {
     0x05C0: "UCB0CTL1", 0x05C1: "UCB0CTL0", 0x05C2: "UCB0BR0", 0x05C3: "UCB0BR1",
