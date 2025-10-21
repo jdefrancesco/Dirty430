@@ -208,7 +208,7 @@ def main():
     blocks = cf.find_large_blocks(176)
     for i,(addr,size) in enumerate(blocks):
         if size >= 1024:
-            lbl = "POTENTIAL_AES_TTABLE_%d_%dB" % (i,size)
+            lbl = "POTENTIAL_AES_TABLE_%d_%dB" % (i,size)
             make_label(addr,lbl)
             define_array_at(addr, min(size,4096), ByteDataType())
             cf.report.append((lbl,addr))
@@ -219,9 +219,13 @@ def main():
             cf.report.append((lbl,addr))
 
     print("\n=== Results ===")
+    rep_count = 0
     for lbl, addr in cf.report:
         print("  %-35s @ %s" % (lbl, fmt_addr(addr)))
-    print("Total labels: ", len(cf.report))
+        rep_count += 1
+    print("Total labels: %d" % rep_count)
+
+    print("===== END CRYPTO FINDER ======")
 
 if __name__ == "__main__":
     main()

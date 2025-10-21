@@ -61,7 +61,7 @@ SPI_MIN_TX_IN_BURST = 6     # min TX writes to call it a SPI burst
 CS_LINK_WINDOW       = 20   # instr distance to associate PxOUT write with TX start/stop
 PARALLEL_MIN_WRITES  = 8    # min writes to same periph addr to export as "parallel" burst
 SLIDE_WINDOW         = 24   # window for grouping writes
-# =========================================
+
 
 def ensure_export_dir():
     if not os.path.exists(EXPORT_DIR):

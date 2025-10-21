@@ -1,12 +1,6 @@
 # -*- coding: utf-8 -*-
 # DirtyDecompiler.py
 
-# Performs multiple cleanups on MSP430 decompiled output:
-# NOTE: Alot of this was adapted from an old IDA Script I had written.
-#       Still debugging heavy before I merge into Dirty430.py. One Ghidra
-#       Module  will be much simpler to get on machines probably...
-
-#  - Arithmetic simplification (mul/div). No mul/div unit.
 #  - Bitmask macro cleanup
 #  - Switch recovery
 #  - Struct detection
