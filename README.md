@@ -4,27 +4,16 @@
 
 Ghidra plugin to analyze and clean up `msp430f5438` firmware binaries.
 
-The plugin has two simple phases:
+The plugin does a couple helpful things:
 
-1. **Post Analyze Phase**: This phase identifies and marks the vector table found in `MSP430F5438` firmware binaries.
-    It also identifies and marks the interrupt service routines (ISRs) associated with the vectors in the table.
-2. **Cleanup Phase**: This simply marks memory mapped registers (MMRs) and other special function registers (SFRs) in the disassembly.
+* Creates correct memory map for MSP430F5438
+* Labels SFR with comments to specify offsets
+* Labels Interrupt Vector Table
+* Sets SP from vector table.
 
-**NOTE:** This plugin is hardcoded for the `MSP430f5438` microcontroller. However, it c:wa
+
+**NOTE:** This plugin is hardcoded for the `MSP430f5438` microcontroller. However, it
 an be easily adapted to other `MSP430` variants by modifying the relevant parameters in the code.
-
-
-## Post Decompile Phase Optimizations.
-
-NOTE: Developed in seperate module for now. Heavily adapted from one of my old IDA Scripts.
-
-The cleaning of Decompiled code can go a long way for the `MSP430`:
-We attempt to apply the following to decompilation output:
-
-  - Bitmask macro 
-  - Switch recovery
-  - Struct detection
-  - Constant folding
 
 
 ## FindCrypt
