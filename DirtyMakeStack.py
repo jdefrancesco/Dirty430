@@ -151,4 +151,5 @@ def main():
     label_vectors_and_targets()
     print("[D430] Done. Re-run Auto Analyze.")
 
-main()
+if __name__ == "__main__":
+    main()
