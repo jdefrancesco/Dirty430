@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 # DirtyCleanup.py
-# MSP430F5438 Memory Block Renamer
 
 #@author J. DeFrancesco
 #@category Memory
@@ -38,7 +37,7 @@ def rename_dat_globals():
             new_name = "g_" + name[4:].lower()
             try:
                 symtab.renameSymbol(sym, new_name, None)
-                print(f"[+] Renamed {name} -> {new_name}")
+                print("[+] Renamed %s -> %s" % (name, new_name))
             except:
                 pass
 

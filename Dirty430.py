@@ -1,18 +1,7 @@
 # -*- coding: utf-8 -*-
 # Dirty430.py - Ghidra script to fix up MSP430F5438 binaries. It first labels all memory
 # mapped registers and creates functions at interrupt vectors if need be.
-# After that we attempt to clean the C up a bit by doing the following:
 
-# NOTE: See DirtyDecompiler.py.
-#  - MUL/DIV SimplIfications (No hardware support on msp430s)
-#  - Cleanup any weird stack behavior (to some degree anyway)
-#  - Bitmask macro cleanup
-#  - Switch recovery
-#  - Struct detection
-#  - Peripheral register renaming (if mapping provided)
-#  - Constant folding
-#
-# - Will be provided in another module during debug.
 
 #@author J. DeFrancesco
 #@category MSP430
@@ -22,19 +11,24 @@ from ghidra.program.model.symbol import SourceType # pyright: ignore[reportMissi
 from ghidra.program.model.data import ByteDataType, WordDataType # pyright: ignore[reportMissingModuleSource]
 from ghidra.program.model.address import AddressOutOfBoundsException # pyright: ignore[reportMissingModuleSource]
 
-# Decompilation imports...
 from ghidra.app.decompiler import DecompInterface
 from ghidra.program.model.pcode import PcodeOp
 from ghidra.util.task import ConsoleTaskMonitor
-# from ghidra.app.decompiler.clang import ClangTokenGroup
 from ghidra.program.model.listing import CodeUnit
 
-# FlatProgramAPI is optional, so we try to import it but don't fail if not present.
 try:
     from ghidra.program.flatapi import FlatProgramAPI
 except Exception:
     FlatProgramAPI = None
 
+from ghidra.program.model.data import (
+    DataUtilities, Undefined1DataType, Undefined2DataType,
+    Undefined4DataType, ByteDataType, WordDataType, DWordDataType
+)
+
+from java.math import BigInteger
+from ghidra.program.model.lang import RegisterValue
+from ghidra.program.model.symbol import SourceType
 
 # Register blocks for the MSP430F5438, from the datasheet.
 MSP430F5438_REG_BLOCKS = {
@@ -309,67 +303,8 @@ _BITFIELD_ALIASES = {
 }
 
 
-# TODO: Can remove after refactor.
-gPM = currentProgram
-gMEM = gPM.getMemory()
-gSYMTAB = gPM.getSymbolTable()
 
-
-PROGRAM = None
-ADDRESS = None
-MONITOR = None
-
-# HELPERS FOR IMPORT Context.
-def set_ctx(program=None, address=None, monitor=None):
-    """Initialize context when called from the REPL or wrapper."""
-       
-
-    import __main__
-    global PROGRAM, ADDRESS, MONITOR
-
-    if program is None:
-        program = getattr(__main__, 'currentProgram', None)
-    if address is None:
-        address = getattr(__main__, 'currentAddress', None)
-    if monitor is None:
-        monitor = getattr(__main__, 'monitor', None)
-    if program is None:
-        raise RuntimeError("DirtyDecompiler.set_ctx: supply program=currentProgram or run as a Ghidra script.")
-    PROGRAM, ADDRESS, MONITOR = program, address, monitor
-
-def _ensure_ctx():
-    """Call at the start of any function that touches PROGRAM/ADDRESS/MONITOR."""
-    if PROGRAM is None:
-        set_ctx()  
-
-def _comment_text_for_bits(bits_dict):
-    # Produce a compact one-line comment listing bit names and masks
-    pairs = ["%s=0x%X" % (k, v) for (k, v) in sorted(bits_dict.items(), key=lambda kv: kv[1])]
-    return "Dirty430 bits: " + ", ".join(pairs)
-
-
-# Script is idempotent by default, only creating labels/functions/data if missing.
-# Set FORCE_OVERWRITE = True to allow the script to clear existing data/instructions
-# in target regions before redefining them. Use with
-# caution. You could screw up analysis Ghidra did already.
-FORCE_OVERWRITE = False
-
-# Verbose logging toggle: when True, log every skip/decision; when False, only key actions.
-VERBOSE = True
-
-# Stats..
-_STAT = {
-    'data_created': 0,
-    'data_skipped_existing': 0,
-    'data_skipped_overlap_data': 0,
-    'data_skipped_instr': 0,
-    'data_skipped_instr_overlap': 0,
-    'ranges_cleared': 0,
-}
-
-
-# TODO: UGLY refactor some day.
-def _addr_int(a):
+def addr_int(a):
     """Return integer offset for either an int/long or a Ghidra Address-like object."""
 
     if a is None:
@@ -390,40 +325,20 @@ def _addr_int(a):
 def fmt_addr(a):
     """Format an address or int as 0xXXXXXXXX cause it annoys me."""
 
-    return "0x%X" % _addr_int(a)
-
-
-# Found this somewhere on github and seemed good enough for our purposes. Had to make a 
-# few changes.
-def _log(msg, kind='info', always=False):
-    """Internal logging wrapper: emits via Msg and also prints for the script console..."""
-
-    if not VERBOSE and not always:
-        # Still show final summary lines (they use always=True) but skip noisy items.
-        return
-    if kind == 'warn':
-        Msg.warn(None, msg)
-    elif kind == 'error':
-        Msg.error(None, msg)
-    else:
-        Msg.info(None, msg)
-    try:
-        print(msg)
-    except Exception:
-        pass
+    return "0x%X" % addr_int(a)
 
 
 def to_addr(addr):
     """Convert an integer to an Address object."""
 
-    return gPM.getAddressFactory().getDefaultAddressSpace().getAddress(addr)
+    return currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(addr)
 
 
 def mem_has(a_addr):
     """Check if memory contains the given address."""
 
     try:
-        return gMEM.contains(to_addr(a_addr))
+        return currentProgram.getMemory().contains(to_addr(a_addr))
     except AddressOutOfBoundsException as e:
         Msg.error(None, "[!] Address out of bounds: %s" % e )
         return False
@@ -436,7 +351,7 @@ def apply_bitfield_comments():
     Returns count of annotations applied.
     """
 
-    listing = gPM.getListing()
+    listing = currentProgram.getListing()
     applied = 0
 
     def _annotate(addr_int, reg_name):
@@ -462,10 +377,6 @@ def apply_bitfield_comments():
         except Exception:
             return 0
 
-    # From the flat list
-    # for addr, (name, _w) in EMBEDDED_REGS.items():
-    #     applied += _annotate(addr, name)
-
     # From the structured blocks
     for base, blk in MSP430F5438_REG_BLOCKS.items():
         regs = blk.get('regs', [])
@@ -474,208 +385,89 @@ def apply_bitfield_comments():
 
     return applied
 
+# def make_data(addr, word_size):
+#     """Create data at the given address with the specified word size (1 or 2 bytes).
 
-def _infer_reg_width(name):
-    """Return correct data width (1 or 2 bytes) for a given register name.
+#     Expands and clears any conflicting code/data units fully before insertion.
+#     Returns True if created, False if it already existed or failed.
+#     """
+#     a = to_addr(addr)
+#     end_addr = a.add(word_size - 1)
 
-    MSP430F5438 has many 8‑bit USCI regs and 16‑bit others; this avoids
-    overlapping words at odd addresses.
-    """
-    try:
-        # Legacy SFR byte-sized mirrors (IE1/IFG1/ME1 and IE2/IFG2/ME2) are 8-bit
-        if name in ('IE1', 'IFG1', 'ME1', 'IE2', 'IFG2', 'ME2'):
-            return 1
-        # Ports are bytes
-        if name.startswith('P') and (len(name) >= 2 and name[1].isdigit()):
-            return 1
-        if name.startswith('PJ'):
-            return 1
-        # USCI (UART/SPI/I2C) are mostly bytes; IV is 16‑bit
-        if name.startswith('UCA') or name.startswith('UCB'):
-            return 2 if name.endswith('IV') else 1
-        # ADC12 control are words; MCTL are bytes; MEM are words
-        if name.startswith('ADC12MCTL'):
-            return 1
-        if name.startswith('ADC12MEM') or name.startswith('ADC12CTL'):
-            return 2
-        # Timer control/CCR/IV are words
-        if name.endswith('IV') or name.endswith('EX0'):
-            return 2
-        if name.startswith('TA') or name.startswith('TB'):
-            return 2
-        # DMA ctl/size are words
-        if name.startswith('DMA'):
-            return 2
-        # Default to word unless clearly byte‑typed
-        return 2
-    except Exception:
-        return 2
+#     def _addr_min(x, y):
+#         return x if x.compareTo(y) <= 0 else y
 
-# Addresses that come from the structured block map (authoritative). Used to skip
-# duplicates from EMBEDDED_REGS that would collide or disagree on width.
-_DEF_BLOCK_ADDRS = None
+#     def _addr_max(x, y):
+#         return x if x.compareTo(y) >= 0 else y
 
+#     def _expand_to_cover_conflicts(start, end):
+#         """If there is any containing data/instruction spanning the edges,
 
-def _build_block_addr_set():
-    global _DEF_BLOCK_ADDRS
-    if _DEF_BLOCK_ADDRS is None:
-        s = set()
-        for base, blk in MSP430F5438_REG_BLOCKS.items():
-            for (n, off) in blk.get('regs', []):
-                s.add(base + off)
-        _DEF_BLOCK_ADDRS = s
-    return _DEF_BLOCK_ADDRS
+#         expand [start,end] to fully cover them so clearListing removes the whole unit(s).
+#         """
+#         s, e = start, end
+#         d0 = getDataContaining(start)
+#         if d0 is not None:
+#             s = _addr_min(s, d0.getMinAddress()); e = _addr_max(e, d0.getMaxAddress())
+#         d1 = getDataContaining(end)
+#         if d1 is not None:
+#             s = _addr_min(s, d1.getMinAddress()); e = _addr_max(e, d1.getMaxAddress())
+#         i0 = getInstructionContaining(start)
+#         if i0 is not None:
+#             s = _addr_min(s, i0.getMinAddress()); e = _addr_max(e, i0.getMaxAddress())
+#         i1 = getInstructionContaining(end)
+#         if i1 is not None:
+#             s = _addr_min(s, i1.getMinAddress()); e = _addr_max(e, i1.getMaxAddress())
+#         return s, e
 
-def _build_block_covered_set():
-    """Return a set of ALL byte addresses covered by register-block definitions.
+#     existing_exact = getDataAt(a)
+#     existing_containing = getDataContaining(a)
+#     existing_instr = getInstructionAt(a)
+#     containing_instr = getInstructionContaining(a)
 
-    This includes both bytes of any 16-bit word so we can skip EMBEDDED_REGS
-    entries that would land in the middle of a word (e.g., 0x0161).
-    """
-    covered = set()
-    for base, blk in MSP430F5438_REG_BLOCKS.items():
-        for (name, off) in blk.get('regs', []):
-            addr = base + off
-            w = _infer_reg_width(name)
-            covered.add(addr)
-            if w == 2:
-                covered.add(addr + 1)
-    return covered
+#     # If anything already occupies these bytes, either clear (when FORCED) or skip
+#     if any(x is not None for x in (existing_exact, existing_containing, existing_instr, containing_instr)):
+#         if not FORCE_OVERWRITE:
+#             if existing_exact is not None:
+#                 _STAT['data_skipped_existing'] += 1
+#             if existing_containing is not None and (existing_exact is None):
+#                 _STAT['data_skipped_overlap_data'] += 1
+#             if existing_instr is not None:
+#                 _STAT['data_skipped_instr'] += 1
+#             if containing_instr is not None and (existing_instr is None):
+#                 _STAT['data_skipped_instr_overlap'] += 1
+#             return False
+#         # Expand clearing range to cover full conflicting units
+#         s, e = _expand_to_cover_conflicts(a, end_addr)
+#         try:
+#             clearListing(s, e)
+#             _log("[i] Cleared listing %s-%s for overwrite" % (fmt_addr(s), fmt_addr(e)))
+#             _STAT['ranges_cleared'] += 1
+#         except Exception as ce:
+#             _log("[!] Failed clearing %s-%s: %s" % (fmt_addr(s), fmt_addr(e), ce), 'warn', always=True)
+#             return False
 
-def _build_canonical_name_addr_map():
-    """Build a name->address map from the authoritative register blocks.
+#     try:
+#         dt = WordDataType.dataType if word_size == 2 else ByteDataType.dataType
+#         createData(a, dt)
+#         _STAT['data_created'] += 1
+#         return True
+#     except Exception as e:
+#         # Print more context about the conflicting unit(s)
+#         d_cont = getDataContaining(a)
+#         i_cont = getInstructionContaining(a)
+#         rng = "%s..%s" % (fmt_addr(a), fmt_addr(end_addr))
 
-    Used to skip stale/incorrect entries in EMBEDDED_REGS whose names exist
-    in the datasheet map but point at the wrong address (e.g., ADC12* at 0x0010..).
-    """
-    mapping = {}
-    for base, blk in MSP430F5438_REG_BLOCKS.items():
-        for (name, off) in blk.get('regs', []):
-            mapping[name] = base + off
-    return mapping
+#         if d_cont is not None:
+#             _log("[!] Data conflict in %s vs existing DATA %s..%s (%s)" % (
+#                 rng, fmt_addr(d_cont.getMinAddress()), fmt_addr(d_cont.getMaxAddress()), d_cont.getDataType().getName()), 'warn', always=True)
 
-def _effective_width(addr, name, default_width):
-    """Pick a safe width to prevent overlap.
+#         if i_cont is not None:
+#             _log("[!] Data conflict in %s vs existing INSN %s..%s" % (
+#                 rng, fmt_addr(i_cont.getMinAddress()), fmt_addr(i_cont.getMaxAddress())), 'warn', always=True)
 
-    Also force byte at odd addresses to avoid straddling neighbors.
-    """
-    w = _infer_reg_width(name)
-    # Never widen beyond the declared default; many legacy defs in EMBEDDED_REGS are byte-sized
-    if default_width in (1, 2):
-        if default_width < w:
-            w = default_width
-    # Never create 16-bit data on odd address; it would span a neighbor!!
-    if (w == 2) and (addr & 1):
-        _log("[warn] Forcing BYTE at odd %s for %s (was WORD)" % (fmt_addr(addr), name), 'warn')
-        w = 1
-    return w
-
-def create_register_block_labels():
-    """Create labels/data for MSP430F5438_REG_BLOCKS entries 
-    
-    We have (base + per-reg offsets).
-    Idempotent and respects FORCE_OVERWRITE via make_data(). Returns count created/updated.
-    """
-
-    created = 0
-    for base, blk in MSP430F5438_REG_BLOCKS.items():
-        regs = blk.get('regs', [])
-        for (name, off) in regs:
-            a = base + off
-            if not mem_has(a):
-                continue
-            # Use robust width inference.
-            width = _infer_reg_width(name)
-            make_data(a, width)
-            make_label(a, name)
-            created += 1
-
-    return created
-
-
-def make_data(addr, word_size):
-    """Create data at the given address with the specified word size (1 or 2 bytes).
-
-    Expands and clears any conflicting code/data units fully before insertion.
-    Returns True if created, False if it already existed or failed.
-    """
-    a = to_addr(addr)
-    end_addr = a.add(word_size - 1)
-
-    def _addr_min(x, y):
-        return x if x.compareTo(y) <= 0 else y
-
-    def _addr_max(x, y):
-        return x if x.compareTo(y) >= 0 else y
-
-    def _expand_to_cover_conflicts(start, end):
-        """If there is any containing data/instruction spanning the edges,
-
-        expand [start,end] to fully cover them so clearListing removes the whole unit(s).
-        """
-        s, e = start, end
-        d0 = getDataContaining(start)
-        if d0 is not None:
-            s = _addr_min(s, d0.getMinAddress()); e = _addr_max(e, d0.getMaxAddress())
-        d1 = getDataContaining(end)
-        if d1 is not None:
-            s = _addr_min(s, d1.getMinAddress()); e = _addr_max(e, d1.getMaxAddress())
-        i0 = getInstructionContaining(start)
-        if i0 is not None:
-            s = _addr_min(s, i0.getMinAddress()); e = _addr_max(e, i0.getMaxAddress())
-        i1 = getInstructionContaining(end)
-        if i1 is not None:
-            s = _addr_min(s, i1.getMinAddress()); e = _addr_max(e, i1.getMaxAddress())
-        return s, e
-
-    existing_exact = getDataAt(a)
-    existing_containing = getDataContaining(a)
-    existing_instr = getInstructionAt(a)
-    containing_instr = getInstructionContaining(a)
-
-    # If anything already occupies these bytes, either clear (when FORCED) or skip
-    if any(x is not None for x in (existing_exact, existing_containing, existing_instr, containing_instr)):
-        if not FORCE_OVERWRITE:
-            if existing_exact is not None:
-                _STAT['data_skipped_existing'] += 1
-            if existing_containing is not None and (existing_exact is None):
-                _STAT['data_skipped_overlap_data'] += 1
-            if existing_instr is not None:
-                _STAT['data_skipped_instr'] += 1
-            if containing_instr is not None and (existing_instr is None):
-                _STAT['data_skipped_instr_overlap'] += 1
-            return False
-        # Expand clearing range to cover full conflicting units
-        s, e = _expand_to_cover_conflicts(a, end_addr)
-        try:
-            clearListing(s, e)
-            _log("[i] Cleared listing %s-%s for overwrite" % (fmt_addr(s), fmt_addr(e)))
-            _STAT['ranges_cleared'] += 1
-        except Exception as ce:
-            _log("[!] Failed clearing %s-%s: %s" % (fmt_addr(s), fmt_addr(e), ce), 'warn', always=True)
-            return False
-
-    try:
-        dt = WordDataType.dataType if word_size == 2 else ByteDataType.dataType
-        createData(a, dt)
-        _STAT['data_created'] += 1
-        return True
-    except Exception as e:
-        # Print more context about the conflicting unit(s)
-        d_cont = getDataContaining(a)
-        i_cont = getInstructionContaining(a)
-        rng = "%s..%s" % (fmt_addr(a), fmt_addr(end_addr))
-
-        if d_cont is not None:
-            _log("[!] Data conflict in %s vs existing DATA %s..%s (%s)" % (
-                rng, fmt_addr(d_cont.getMinAddress()), fmt_addr(d_cont.getMaxAddress()), d_cont.getDataType().getName()), 'warn', always=True)
-
-        if i_cont is not None:
-            _log("[!] Data conflict in %s vs existing INSN %s..%s" % (
-                rng, fmt_addr(i_cont.getMinAddress()), fmt_addr(i_cont.getMaxAddress())), 'warn', always=True)
-
-        _log("[!] Failed to create data at %s: %s" % (fmt_addr(a), e), 'warn', always=True)
-        return False
+#         _log("[!] Failed to create data at %s: %s" % (fmt_addr(a), e), 'warn', always=True)
+#         return False
 
 def make_label(addr, name):
     """Create a label at the given address with the specified name."""
@@ -689,17 +481,8 @@ def make_label(addr, name):
     createLabel(a_addr, name, True, SourceType.USER_DEFINED)
     return True
 
-def install_msp430f5438_labels(program=None, logger=_log):
+def install_msp430f5438_labels(program=None):
     """Create labels for MSP430F5438/5438A memory-mapped registers."""
-    if program is None:
-        try:
-            _ensure_ctx()
-            program = PROGRAM
-        except Exception:
-            raise RuntimeError("install_msp430f5438_labels: no program; call set_ctx(...) first")
-
-    if FlatProgramAPI is None:
-        raise RuntimeError("FlatProgramAPI not available")
 
     fpa = FlatProgramAPI(program)
     af = program.getAddressFactory()
@@ -727,174 +510,244 @@ def install_msp430f5438_labels(program=None, logger=_log):
                 # Label may already exist; skip silently
                 pass
 
-    msg = "Dirty430: labeled {} MSP430F5438 registers".format(created)
-    if logger:
-        logger(msg)
-    else:
-        try: Msg.info(None, msg)
-        except: print(msg)
-    return created
-
-def add_external_entry_point(addr):
-    """Set external entry point at the given address."""
-    a_addr = to_addr(addr)
-    Msg.info(None, "[i] Adding external entry point at %s" % fmt_addr(a_addr))
-    try:
-        gPM.getSymbolTable().addExternalEntryPoint(a_addr)
-        return True
-    except Exception as e:
-        Msg.warn(None, "[!] addExternalEntryPoint failed %s: %s" % (fmt_addr(a_addr), e))
-        return False
-
-def make_function(addr, name):
-    """Create a function at the given address with the specified name."""
-
-    a_addr = to_addr(addr)
-    Msg.info(None, "[i] Creating function %s at %s" % (name, fmt_addr(a_addr)))
-    if getFunctionAt(a_addr) is not None:
-        Msg.info(None, "[i] Function already exists at %s" % fmt_addr(a_addr))
-        return False
-
-    createFunction(a_addr, name)
-    Msg.info(None, "[i] Created function %s at %s" % (name, fmt_addr(a_addr)))
-    return True
+    print("[D430] labeled {} MSP430F5438 registers".format(created))
 
 
-_VECTOR_HIGH_BYTES = tuple(range(16))
-
-
-def _has_user_defined_symbol(addr_obj):
+def has_user_defined_symbol(addr_obj):
     """Return True if a user defined symbol exists at the address."""
 
-    for symbol in gSYMTAB.getSymbols(addr_obj):
+    for symbol in currentProgram.getSymbolTable().getSymbols(addr_obj):
         if symbol.getSource() == SourceType.USER_DEFINED:
             return True
     return False
 
-def _vector_label(addr):
-    return "VEC_0x%04X" % addr
+def fix_data_types():
+    dtm = currentProgram.getDataTypeManager()
+    changed = False
 
-def _isr_label(addr):
-    return "ISR_0x%04X" % addr
+    # Replace undefined1→uint8_t, undefined2→uint16_t, undefined4→uint32_t
+    for dt in dtm.getAllDataTypes():
+        if isinstance(dt, Undefined1DataType):
+            dtm.replaceDataType(dt, ByteDataType.dataType, True)
+            changed = True
+        elif isinstance(dt, Undefined2DataType):
+            dtm.replaceDataType(dt, WordDataType.dataType, True)
+            changed = True
+        elif isinstance(dt, Undefined4DataType):
+            dtm.replaceDataType(dt, DWordDataType.dataType, True)
+            changed = True
+    if changed:
+        print("[D430] Fixed undefined data types to standard types.")
 
-def _safe_short(addr_obj):
+def rename_dat_globals():
+    symtab = currentProgram.getSymbolTable()
+    for sym in symtab.getAllSymbols(True):
+        name = sym.getName()
+        if name.startswith("DAT_"):
+            new_name = "g_" + name[4:].lower()
+            try:
+                symtab.renameSymbol(sym, new_name, None)
+                print("[D430] Renamed %s -> %s" % (name, new_name))
+            except:
+                pass
+
+
+# Memory regions for MSP430F5438
+REGIONS = [
+    ("PERIPHERALS",   0x00000, 0x00FFF, "SFR + peripherals"),
+    ("BSL_ROM",       0x01000, 0x017FF, "Bootloader ROM"),
+    ("INFO_FLASH_D",  0x01800, 0x0187F, "Info Flash D"),
+    ("INFO_FLASH_C",  0x01880, 0x018FF, "Info Flash C"),
+    ("INFO_FLASH_B",  0x01900, 0x0197F, "Info Flash B"),
+    ("INFO_FLASH_A",  0x01980, 0x019FF, "Info Flash A"),
+    ("TLV",           0x01A00, 0x01AFF, "TLV Info"),
+    ("Factory Boot",  0x01B00, 0x01BFF, "Factory Boot code"),
+    ("SRAM",          0x01C00, 0x05BFF, "Main RAM"),
+    ("MAIN_FLASH_LO", 0x05C00, 0x0FF7F, "Main Flash lower"),
+    ("INT_VECTORS",   0x0FF80, 0x0FFFF, "Interrupt vectors"),
+    ("MAIN_FLASH_B1", 0x10000, 0x1FFFF, "Main Flash Bank1"),
+    ("MAIN_FLASH_B2", 0x20000, 0x2FFFF, "Main Flash Bank2"),
+    ("MAIN_FLASH_B3", 0x30000, 0x3FFFF, "Main Flash Bank3"),
+    ("MAIN_FLASH_B4", 0x40000, 0x45BFF, "Main Flash Bank4"),
+]
+
+RESET_SP = 0xFFFC
+RESET_PC = 0xFFFE
+VEC_MIN  = 0x0FF80
+VEC_MAX  = 0x0FFFF
+
+VECTOR_NAMES = {
+    0xFFFE: "RESET",
+    0xFFFC: "INITIAL_SP",
+    0xFFFA: "NMI",
+    0xFFF8: "USER_NMI"
+    
+}
+
+def toAddr(off):
+    return currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(off)
+
+def mem():
+    return currentProgram.getMemory()
+
+def split_block(start, end, name, comment):
+    m = mem()
+    a0 = toAddr(start)
+    a1 = toAddr(end + 1)
+    blk = m.getBlock(a0)
+    if blk is None:
+        return
+    
+    if blk.getStart().getOffset() < start:
+        try: m.split(blk, a0)
+        except: return
+    
+    blk = m.getBlock(a0)
+    if blk and blk.getEnd().getOffset() > end:
+        try: m.split(blk, a1)
+        except: pass
+    
+    blk2 = m.getBlock(a0)
+    if blk2:
+        try: blk2.setName(name)
+        except: pass
+        blk2.setComment(comment)
+        
+        if name == "SRAM" or name == "PERIPHERALS":
+            blk2.setPermissions(True, True, False)  # R/W
+        else:
+            blk2.setPermissions(True, False, True)  # R/X
+        
+        print("[D430] Region %-12s 0x%05X-0x%05X" % (name, start, end))
+
+def rename_leftover():
+    m = mem()
+    for blk in m.getBlocks():
+        if blk.getName().startswith("FLASH"):
+            blk.setName("UNMAPPED_FLASH")
+            blk.setPermissions(True, False, True)
+            blk.setComment("Remaining firmware not in known map")
+            print("[D430] Renamed leftover block -> UNMAPPED_FLASH")
+
+
+def safe_word(off):
     try:
-        return getShort(addr_obj) & 0xFFFF
-    except Exception:
+        val = mem().getShort(toAddr(off)) & 0xFFFF
+        return val
+    except:
         return None
 
 
-def _resolve_vector_target(low_word, has_mem):
-    """
-    Creates a clean 16-bit address for vector table.
-    
-    Helper. Will move into a class/func on refactor
-    """
-
-    for high in _VECTOR_HIGH_BYTES:
-        candidate = (high << 16) | low_word
-        if has_mem(candidate):
-            return candidate
-    return low_word if has_mem(low_word) else None
+def set_sp(pc_val):
+    lang = currentProgram.getLanguage()
+    reg = lang.getRegister("SP") or lang.getRegister("R1")
+    if not reg:
+        print("[!] No SP register found")
+        return
+    val = BigInteger.valueOf(pc_val)
+    ctx = currentProgram.getProgramContext()
+    ctx.setRegisterValue(currentProgram.getMinAddress(), currentProgram.getMaxAddress(), RegisterValue(reg, val))
+    print("[D430] Set SP = 0x%04X" % pc_val)
 
 
-def install_reset_vector_info(addr):
-    """Install reset vector info at the given address.
-    
-    TODO: Currently in main but refactor out and place
-    here later. 
-    """
-    pass
+def set_entry_point(pc_val):
+    addr = toAddr(pc_val)
+    st = currentProgram.getSymbolTable()
+    fm = currentProgram.getFunctionManager()
 
+    # Create/reset label
+    try:
+        st.createLabel(addr, "reset_handler", SourceType.USER_DEFINED)
+    except:
+        pass
+
+    # Mark as program entry point
+    try:
+        st.addExternalEntryPoint(addr)
+    except:
+        pass
+
+    # Create function at this address (Ghidra requires name, entry addr, body=None, sourceType)
+    if fm.getFunctionAt(addr) is None:
+        try:
+            fm.createFunction("reset_handler", addr, None, SourceType.USER_DEFINED)
+        except:
+            print("[!] Could not create function at 0x%04X" % pc_val)
+
+    print("[D430] Set reset handler at 0x%04X" % pc_val)
+
+
+def label_vectors():
+    off = VEC_MAX
+    while off >= VEC_MIN:
+        name = VECTOR_NAMES.get(off, "VEC_%04X" % off)
+        addr = toAddr(off)
+        currentProgram.getSymbolTable().createLabel(addr, name, SourceType.USER_DEFINED)
+        
+        tgt = safe_word(off)
+        if tgt and tgt not in (0xFFFF, 0x0000):
+            currentProgram.getSymbolTable().createLabel(toAddr(tgt), "ISR_" + name, SourceType.USER_DEFINED)
+        
+        off -= 2
+
+
+def cleanup_leftover_blocks():
+    m = mem()
+    for blk in list(m.getBlocks()):
+        name = blk.getName()
+        # Detect leftover automatically created split blocks
+        if ".split" in name or name.upper().startswith("FLASH"):
+            try:
+                blk.setName("UNMAPPED_FLASH")
+                blk.setPermissions(True, False, True)  # RX only
+                blk.setComment("Firmware bytes not mapped to known MSP430F5438 region")
+                print("[D430] Renamed leftover block -> UNMAPPED_FLASH")
+            except:
+                pass
+
+def split_mem_block():
+    print("[D430] Fixing MSP430F5438 Memory Map ")
+
+    for name, start, end, comment in REGIONS:
+        split_block(start, end, name, comment)
+
+    cleanup_leftover_blocks()
+
+    print("[D430] Setting Reset SP and PC ")
+    sp = safe_word(RESET_SP)
+    if sp:
+        set_sp(sp)
+
+    pc = safe_word(RESET_PC)
+    if pc:
+        set_entry_point(pc)
+
+    print("[D430]: Labeling Interrupt Vectors ")
+    label_vectors()
+
+    print("[D430] Memory Map fix complete.\n")
 
 def main():
     """Main function. """
 
-    _log("======= Starting Dirty430 script!  =======\n\n")
+    print("======= Starting Dirty430 script  =======\n\n")
 
-    applied = 0
-    _log("[*] Attempting to resolve/create vector functions/labels...")
+    print("[D430] Fixing Memory Map.")
+    split_mem_block()
 
-    # Vectors region (0xFF80..0xFFFF) create words & label and attempt to resolve ISR targets
-    # Handles 20-bit addresses by just resolving the low 16 bits for now...
-
-    # TODO: Refactor this all into one function.
-    mem_contains = mem_has
-    to_address = to_addr
-    for va in range(0xFF80, 0x10000, 2):
-        if not mem_contains(va):
-            continue
-
-        addr_obj = to_address(va)
-
-        # Data at vector entry
-        if FORCE_OVERWRITE or getDataAt(addr_obj) is None:
-            make_data(va, 2)
-
-        # Add label (if missing)
-        if FORCE_OVERWRITE or not _has_user_defined_symbol(addr_obj):
-            make_label(va, _vector_label(va))
-
-        low_word = _safe_short(addr_obj)
-        if low_word is None:
-            applied += 1
-            continue
-
-        # Resolve vector addr.
-        resolved = _resolve_vector_target(low_word, mem_contains)
-        if not resolved:
-            applied += 1
-            continue
-
-        resolved_addr = to_address(resolved)
-        isr_name = _isr_label(resolved)
-
-        if FORCE_OVERWRITE or getFunctionAt(resolved_addr) is None:
-            make_function(resolved, isr_name)
-
-        make_label(resolved, isr_name)
-
-        # Reset vector, create entry point
-        if va == 0xFFFE:
-            add_external_entry_point(resolved)
-
-        applied += 1
-
-    _log("[i] Created %d vector entries" % applied, always=True)
-
-    # Now create memory mapped register labels... Reset counter.
-    applied = 0
-    _log("[i] Attempting to resolve/create embedded register labels and bitfields", always=True)
-
-    block_addrs = _build_block_addr_set()
-    block_cov = _build_block_covered_set()
-    canon_by_name = _build_canonical_name_addr_map()
     # Insert more complete set of MSP430F5438 register labels
-    applied += install_msp430f5438_labels(program=gPM, logger=_log)
-    _log("[i] Created/updated %d MSP430F5438 register labels" % applied, always=True)
+    print("[D430] Installing MSP430F5438 register labels...")
+    install_msp430f5438_labels(program=currentProgram)
 
-    # Create labels from the structured block map and annotate bitfields
-    created_blk = create_register_block_labels()
-    _log("[i] Created %d register-block labels" % created_blk, always=True)
 
     # Add bitfield comments
-    annotated = apply_bitfield_comments()
-    _log("[i] Added bitfield comments on %d regs" % annotated, always=True)
+    print("[D430] Applying bitfield comments to known registers...")
+    apply_bitfield_comments()
 
-    # Summary statistics
-    _log("\n======= Dirty430 Summary =======", always=True)
-    _log("FORCE_OVERWRITE: %s" % FORCE_OVERWRITE, always=True)
-    _log("VERBOSE: %s" % VERBOSE, always=True)
-    _log("Data created: %d" % _STAT['data_created'], always=True)
-    _log("Ranges cleared: %d" % _STAT['ranges_cleared'], always=True)
-    _log("Skipped existing (exact): %d" % _STAT['data_skipped_existing'], always=True)
-    _log("Skipped overlap data: %d" % _STAT['data_skipped_overlap_data'], always=True)
-    _log("Skipped instruction exact: %d" % _STAT['data_skipped_instr'], always=True)
-    _log("Skipped instruction overlap: %d" % _STAT['data_skipped_instr_overlap'], always=True)
-    _log("================================\n", always=True)
-
-    # Peace out homies..
-    _log("[*] Finished Dirty430 PHASE 1!")
+    print("[i] Fixing Data Types...")
+    fix_data_types()
+  
+    print("======= Finished Dirty430 =======")
 
 if __name__ == "__main__":
     main()
