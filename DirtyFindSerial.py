@@ -9,6 +9,9 @@
 #
 # Run from Ghidra Script Manager with your MSP430F5438 firmware loaded.
 
+#@author J. DeFrancesco
+#@category MSP430
+
 from collections import deque, defaultdict
 from ghidra.program.model.symbol import SourceType
 from java.io import File, FileOutputStream

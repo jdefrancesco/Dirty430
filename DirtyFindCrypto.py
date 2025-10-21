@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
 # DirtyFindCrypto.py
 #
-# Fast crypto constant finder for Ghidra (MSP430, embedded firmware, etc.)
-# FIXED: bytearray -> Java signed byte[] conversion (no more OverflowError!)
-#
-# Usage: Run inside Ghidra (Script Manager). Labels, bookmarks, and comments are auto-added.
-# Optional CSV export can be enabled below.
-#
-# Author: J. DeFrancesco (improved by ChatGPT)
+# Fast crypto constant finder for Ghidra 
+
+#@author J. DeFrancesco
+#@category MSP430
+
 
 
 EXPORT_CSV = False
