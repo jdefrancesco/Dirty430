@@ -687,8 +687,8 @@ def main():
     print("[D430] Applying bitfield comments to known registers...")
     apply_bitfield_comments()
 
-    print("[D430] Fixing Data Types...")
-    fix_data_types()
+    print("[D430] Fixing Data Types is OFF...")
+    # fix_data_types()
   
     print("======= Finished Dirty430 =======")
 
