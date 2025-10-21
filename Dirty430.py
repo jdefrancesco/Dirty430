@@ -441,7 +441,7 @@ def fix_data_types():
     dtm = currentProgram.getDataTypeManager()
     changed = False
 
-    # Replace undefined1→uint8_t, undefined2→uint16_t, undefined4→uint32_t
+    # Replace undefined1 -> uint8_t, undefined2→uint16_t, undefined4→uint32_t
     for dt in dtm.getAllDataTypes():
         if isinstance(dt, Undefined1DataType):
             dtm.replaceDataType(dt, ByteDataType.dataType, True)
@@ -452,6 +452,7 @@ def fix_data_types():
         elif isinstance(dt, Undefined4DataType):
             dtm.replaceDataType(dt, DWordDataType.dataType, True)
             changed = True
+
     if changed:
         print("[D430] Fixed undefined data types to standard types.")
 
@@ -529,7 +530,7 @@ def split_block(start, end, name, comment):
         except: pass
         blk2.setComment(comment)
         
-        if name == "SRAM" or name == "PERIPHERALS":
+        if name == "SRAM" or name == "PERIPHERALS" or "TLV":
             blk2.setPermissions(True, True, False)  # R/W
         else:
             blk2.setPermissions(True, False, True)  # R/X
@@ -638,7 +639,7 @@ def split_mem_block():
     if pc:
         set_entry_point(pc)
 
-    print("[D430]: Labeling Interrupt Vectors ")
+    print("[D430] Labeling Interrupt Vectors ")
     label_vectors()
 
     print("[D430] Memory Map fix complete.\n")
@@ -660,7 +661,7 @@ def clean_functions():
     fix_data_types()
 
     #  Rename ugly DAT_ globals
-    rename_dat_globals()
+    # rename_dat_globals()
 
     # Clean all functions
     fm = currentProgram.getFunctionManager()
@@ -672,7 +673,7 @@ def clean_functions():
 def main():
     """Main function. """
 
-    print("======= Starting Dirty430 script  =======\n\n")
+    print("======= Starting Dirty430 script  =======")
 
     print("[D430] Fixing Memory Map.")
     split_mem_block()
@@ -686,8 +687,7 @@ def main():
     print("[D430] Applying bitfield comments to known registers...")
     apply_bitfield_comments()
 
-    print("[i] Fixing Data Types...")
-    # TODO: Replace with clean_functions()?
+    print("[D430] Fixing Data Types...")
     fix_data_types()
   
     print("======= Finished Dirty430 =======")
