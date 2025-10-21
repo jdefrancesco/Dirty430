@@ -727,6 +727,32 @@ def split_mem_block():
 
     print("[D430] Memory Map fix complete.\n")
 
+def clean_function(func):
+    func.setCustomVariableStorage(True)
+    func.setStackPurgeSize(0)
+    func.setReturnAddressOffset(0)
+
+    ifc = DecompInterface()
+    ifc.openProgram(currentProgram)
+    ifc.setOptions(ifc.getOptions())
+    ifc.decompileFunction(func, 30, ConsoleTaskMonitor())
+
+def clean_functions():
+    print("[D430] Cleaning decompiler artifacts...")
+
+    #  Replace undefined types
+    fix_data_types()
+
+    #  Rename ugly DAT_ globals
+    rename_dat_globals()
+
+    # Clean all functions
+    fm = currentProgram.getFunctionManager()
+    for func in fm.getFunctions(True):
+        clean_function(func)
+
+    print("[D430] Press Ctrl+Shift+R in decompiler to refresh view.")
+
 def main():
     """Main function. """
 
@@ -745,6 +771,7 @@ def main():
     apply_bitfield_comments()
 
     print("[i] Fixing Data Types...")
+    # TODO: Replace with clean_functions()?
     fix_data_types()
   
     print("======= Finished Dirty430 =======")
