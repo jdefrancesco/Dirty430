@@ -254,19 +254,7 @@ def main():
         add_crypto_bookmark(a, COMMENT_PREFIX + " TEA_DELTA", "TEA delta constant")
         cf.report.append((lbl, a))
 
-    # Optional heuristic: scan large contiguous readable blocks (unchanged)
-    # blocks = cf.find_large_blocks(176)
-    # for i,(addr,size) in enumerate(blocks):
-    #     if size >= 1024:
-    #         lbl = "POTENTIAL_AES_TABLE_%d_%dB" % (i,size)
-    #         make_label(addr,lbl)
-    #         define_array_at(addr, min(size,4096), ByteDataType())
-    #         cf.report.append((lbl,addr))
-    #     else:
-    #         lbl = "CRYPTO_LARGE_BLOCK_%d_%dB" % (i,size)
-    #         make_label(addr,lbl)
-    #         define_array_at(addr, min(size,1024), ByteDataType())
-    #         cf.report.append((lbl,addr))
+
 
     print("\n Crypto Results:\n")
     rep_count = 0
