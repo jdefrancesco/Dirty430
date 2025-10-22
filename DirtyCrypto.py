@@ -384,6 +384,7 @@ def analyze_functions_marking(tables):
 
 def detect_rc4_asm_in_function(func):
     """Look for rc4 heuristic instructions."""
+
     score = 0
     flags = set()
     pcs = []
@@ -621,6 +622,8 @@ def main():
 
     ta = JTextArea("\n".join(lines), 16, 80); ta.setEditable(False)
     JOptionPane.showMessageDialog(None, JScrollPane(ta), "D430 Crypto Summary", JOptionPane.PLAIN_MESSAGE)
+
+    print("==== D430 Crypto Finished! ====")
 
 if __name__ == "__main__":
     main()

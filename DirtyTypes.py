@@ -1,7 +1,11 @@
+# DirtyTypes.py
+# This script allows you to create data structures via inserting C code into the popup dialog
+# instead of using the painful GUI option... 
+
+#@author J. DeFrancesco
 #@category DataTypes
 #@menupath Tools.Parse C Structs
 
-# XXX: WARNING LLM Generated.. Works fine for now.
 
 from ghidra.app.util.cparser.C  import CParser
 from ghidra.program.model.data import DataTypeConflictHandler
@@ -18,7 +22,7 @@ def run():
     scroll.setPreferredSize(Dimension(800, 500))
 
     result = JOptionPane.showConfirmDialog(
-        None, scroll, "Enter your C typedefs / structs:", 
+        None, scroll, "Enter your C typedefs / struct:", 
         JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE
     )
 
