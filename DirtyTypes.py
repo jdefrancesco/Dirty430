@@ -6,8 +6,8 @@
 from ghidra.app.util.cparser.C  import CParser
 from ghidra.program.model.data import DataTypeConflictHandler
 from ghidra.util import Msg
-from javax.swing import *
 from java.awt import Dimension
+from javax.swing import JTextArea, JScrollPane, JOptionPane
 
 def run():
     # Multiline input box for struct text
