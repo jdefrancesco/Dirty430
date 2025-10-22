@@ -525,6 +525,47 @@ def func_accesses_io(func):
         pass
     return hits
 
+def find_crc16_constants():
+    """
+    Scan memory for CRC-16 constants/polynomials in little endian.
+    Common ones:
+      - CRC16-IBM:    0x8005  -> bytes: 05 80
+      - CRC16-CCITT:  0x1021  -> bytes: 21 10
+      - CRC16-MODBUS: 0xA001  -> bytes: 01 A0
+    """
+    CRC16_POLYS = {
+        "\x05\x80": "CRC16_IBM (0x8005)",
+        "\x21\x10": "CRC16_CCITT (0x1021)",
+        "\x01\xA0": "CRC16_MODBUS (0xA001)"
+    }
+
+    hits = []
+    for blk in memory.getBlocks():
+        if not blk.isInitialized():
+            continue
+        start = blk.getStart()
+        size = blk.getSize()
+        off = 0
+        while off < size:
+            chunk = MAX_CHUNK if (size - off) > MAX_CHUNK else (size - off)
+            base = start.add(off)
+            bb = read_bytes(base, chunk)
+            if bb is None:
+                off += chunk
+                continue
+
+            for i in range(0, len(bb) - 2 + 1):
+                pair = bb[i:i+2]
+                for k in CRC16_POLYS:
+                    if pair == bytearray(k):
+                        addr = base.add(i)
+                        note(addr, BOOKMARK_TABLE, "CRC16", "CRC-16 polynomial found: " + CRC16_POLYS[k])
+                        hits.append(addr)
+
+            off += chunk
+
+    return hits
+
 
 def main():
     
@@ -536,6 +577,7 @@ def main():
     print("[D430] Attempting to find potential S-Box tables")
     tables = find_256_tables()
     aes_hits = find_aes_rcon_and_sboxes()
+    crc16_hits = find_crc16_constants()
 
     # Prng constants scan..
     print("[D430] Scanning for constants")
@@ -562,7 +604,8 @@ def main():
 
     elapsed = time.time() - start
     lines = []
-    lines.append("Mega scan complete in %.2f s" % (elapsed,))
+    lines.append("D430 scan complete in %.2f s" % (elapsed,))
+    lines.append("CRC16 constants found: %d" % (len(crc16_hits),))
     lines.append("RC4 S[] tables: %d" % (len(tables),))
     lines.append("AES/Rcon hits: %d" % (len(aes_hits),))
     lines.append("PRNG constant data hits: %d" % (len(prng_res.get("data", [])),))
