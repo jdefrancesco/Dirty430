@@ -1,42 +1,49 @@
 #@category DataTypes
-#@menupath Tools.User Parse C Structs
+#@menupath Tools.Parse C Structs
 
-"""
-This script allows the user to paste C-style typedefs / structs directly,
-and Ghidra will parse them and add them to the current program's DataTypeManager.
-"""
+# XXX: WARNING LLM Generated.. Works fine for now.
 
-from ghidra.app.util.cparser.C import CParserUtils
+from ghidra.app.util.cparser.C  import CParser
 from ghidra.program.model.data import DataTypeConflictHandler
 from ghidra.util import Msg
-from javax.swing import JOptionPane
+from javax.swing import *
+from java.awt import Dimension
 
 def run():
-    # Prompt the user for their C struct/typedef definitions
-    user_input = JOptionPane.showInputDialog(
-        None,
-        "Enter your C typedefs/structs here:",
-        "Parse C Structs",
-        JOptionPane.PLAIN_MESSAGE
+    # Multiline input box for struct text
+    text_area = JTextArea(25, 80)
+    text_area.setLineWrap(True)
+    text_area.setWrapStyleWord(True)
+    scroll = JScrollPane(text_area)
+    scroll.setPreferredSize(Dimension(800, 500))
+
+    result = JOptionPane.showConfirmDialog(
+        None, scroll, "Enter your C typedefs / structs:", 
+        JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE
     )
-    
-    # If user cancels, exit
-    if user_input is None:
-        Msg.info(self, "User cancelled.")
+
+    if result != JOptionPane.OK_OPTION:
+        Msg.info(None, "User cancelled input.")
         return
 
-    # Trim whitespace
-    c_text = user_input.strip()
-    
-    if c_text == "":
-        Msg.showError(self, None, "Error", "No C code provided!")
+    c_code = text_area.getText().strip()
+    if not c_code:
+        Msg.showError(None, "Error", "No C code provided!")
         return
 
     dtm = currentProgram.getDataTypeManager()
 
     try:
-        # Parse the C code into the DataTypeManager
-        CParserUtils.parseString(c_text, dtm, DataTypeConflictHandler.DEFAULT_HANDLER)
-        Msg.showInfo(self, "Success", "✅ C structs/typedefs parsed and imported successfully.")
+        # Use Ghidras built-in C preprocessor & parser
+        pp = CParser(dtm)
+        parsed = pp.parse(c_code)
+
+        dtm.addDataType(parsed, None)
+
+
+        print("Success!")
     except Exception as e:
-        Msg.showError(self, None, "Parsing Error", "❌ Failed to parse C code:\n\n" + str(e))
+        print(e)
+        
+if __name__ == "__main__":
+    run()
