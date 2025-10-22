@@ -555,16 +555,17 @@ def safe_word(off):
         return None
 
 
-def set_sp(pc_val):
-    lang = currentProgram.getLanguage()
-    reg = lang.getRegister("SP") or lang.getRegister("R1")
-    if not reg:
-        print("[!] No SP register found")
-        return
-    val = BigInteger.valueOf(pc_val)
-    ctx = currentProgram.getProgramContext()
-    ctx.setRegisterValue(currentProgram.getMinAddress(), currentProgram.getMaxAddress(), RegisterValue(reg, val))
-    print("[D430] Set SP = 0x%04X" % pc_val)
+# def set_sp(pc_val):
+#     """For emulation """
+#     lang = currentProgram.getLanguage()
+#     reg = lang.getRegister("SP") or lang.getRegister("R1")
+#     if not reg:
+#         print("[!] No SP register found")
+#         return
+#     val = BigInteger.valueOf(pc_val)
+#     ctx = currentProgram.getProgramContext()
+#     ctx.setRegisterValue(currentProgram.getMinAddress(), currentProgram.getMaxAddress(), RegisterValue(reg, val))
+#     print("[D430] Set SP = 0x%04X" % pc_val)
 
 
 def set_entry_point(pc_val):
@@ -629,11 +630,6 @@ def split_mem_block():
         split_block(start, end, name, comment)
 
     cleanup_leftover_blocks()
-
-    print("[D430] Setting Reset SP and PC ")
-    sp = safe_word(RESET_SP)
-    if sp:
-        set_sp(sp)
 
     pc = safe_word(RESET_PC)
     if pc:
