@@ -28,6 +28,7 @@ BOOKMARK_PRNG       = "CRYPTO_PRNG"
 BOOKMARK_CRYPTO_IO  = "CRYPTO_IO"
 BOOKMARK_TABLE      = "CRYPTO_TABLE"
 BOOKMARK_XTEA       = "CRYPTO_XTEA"
+BOOKMARK_MOD        = "CRYPTO_MOD"
 
 MAX_CHUNK = 0x10000
 DECOMP_TIMEOUT = 6
@@ -70,11 +71,22 @@ RE_PRNG_PM    = re.compile(r'16807|127773|2836|0x41a7|0x1f31d|0x0b14', re.IGNORE
 RE_PRNG_KNUTH = re.compile(r'161803398|1000000000|55|24', re.IGNORECASE)
 RE_LCG        = re.compile(r'1103515245|12345|65539|0x41c64e6d|0x3039|0x00010003', re.IGNORECASE)
 
-# less brittle heuristics for RC4-like variants (VMPC, RC4A) in decompiler text
-# these use loose patterns and counts rather than strict shapes
+# less brittle RC4-like variant hints (VMPC/RC4A)
 RE_INDEXED_ARRAY = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\s*\[', re.IGNORECASE)
 RE_ARRAY_XOR     = re.compile(r'\]\s*\^\s*[A-Za-z_][A-Za-z0-9_]*\s*\[', re.IGNORECASE)
 RE_NESTED_ARRAY  = re.compile(r'\[[^\]]*\[[^\]]*\]', re.IGNORECASE)
+
+# MSP430 specific asm regexes for runtime S detection and modulo
+RE_MOV_IMM_TO_REG = re.compile(r'\bmov(\.w|\s)\s*#(0x[0-9a-f]+|\d+)\s*,\s*(r\d+)', re.IGNORECASE)
+RE_MOVB_STORE_IDX = re.compile(r'\bmov\.b\s+\S+,\s*([+-]?\d+)\((r\d+)\)', re.IGNORECASE)
+RE_MOVW_STORE_IDX = re.compile(r'\bmov(\.w|\s)\s+\S+,\s*([+-]?\d+)\((r\d+)\)', re.IGNORECASE)
+RE_CMP_256        = re.compile(r'\bcmp\b.*(#0x100|#256)', re.IGNORECASE)
+
+RE_AND_IMM        = re.compile(r'\band(\.b|\.w)?\s+#(0x[0-9a-f]+|\d+)\s*,', re.IGNORECASE)
+RE_SUB_IMM_REG    = re.compile(r'\bsub(\.b|\.w)?\s+#(0x[0-9a-f]+|\d+)\s*,\s*(r\d+)', re.IGNORECASE)
+RE_CMP_IMM_REG    = re.compile(r'\bcmp(\.b|\.w)?\s+#(0x[0-9a-f]+|\d+)\s*,\s*(r\d+)', re.IGNORECASE)
+RE_CALL_DIV       = re.compile(r'\bcall\b.*__(div|divu|mod|rem)', re.IGNORECASE)
+RE_SHIFT          = re.compile(r'\brr[ac]|rla|rlc', re.IGNORECASE)
 
 # Ghidra objects
 memory = currentProgram.getMemory()
@@ -85,6 +97,21 @@ symtab = currentProgram.getSymbolTable()
 refmgr = currentProgram.getReferenceManager()
 
 def note(addr, category, kind, msg):
+    """
+    Create a bookmark and plate comment at the given address, and print a line.
+
+    :param addr: Address to annotate
+    :type addr: Address
+    :param category: Bookmark category string
+    :type category: str
+    :param kind: Bookmark type string
+    :type kind: str
+    :param msg: Message text
+    :type msg: str
+    :return: None
+    :rtype: None
+    """
+
     try:
         bkm.setBookmark(addr, category, kind, msg)
     except:
@@ -96,6 +123,17 @@ def note(addr, category, kind, msg):
     print("%s | %s @ %s : %s" % (category, kind, addr.toString(), msg))
 
 def read_bytes(addr, n):
+    """
+    Read n bytes from memory starting at addr.
+
+    :param addr: Start address
+    :type addr: Address
+    :param n: Number of bytes to read
+    :type n: int
+    :return: Bytearray of data, or None on failure
+    :rtype: bytearray
+    """
+
     try:
         bb = bytearray(n)
         memory.getBytes(addr, bb)
@@ -103,19 +141,124 @@ def read_bytes(addr, n):
     except:
         return None
 
-def is_256_permutation(bb, off=0):
-    if bb is None or off+256 > len(bb): return False
+def _perm_check_bytes(bb, off):
+    """
+    Check if 256 bytes at offset form a permutation of 0..255.
+
+    :param bb: Buffer to inspect
+    :type bb: bytearray
+    :param off: Offset into buffer
+    :type off: int
+    :return: True if permutation
+    :rtype: bool
+    """
+
     seen = [False]*256
     for i in range(256):
         v = bb[off+i]
-        if v < 0:  # jython signed to unsigned
+        if v < 0:
             v = v & 0xff
         if seen[v]:
             return False
         seen[v] = True
     return True
 
+def _perm_check_words_lowbyte(bb, off):
+    """
+    Check if 512 bytes at offset represent 256 words with constant high byte and unique low bytes.
+
+    :param bb: Buffer to inspect
+    :type bb: bytearray
+    :param off: Offset into buffer
+    :type off: int
+    :return: True if low bytes form permutation and high bytes constant
+    :rtype: bool
+    """
+
+    seen = [False]*256
+    high = None
+    for i in range(256):
+        lo = bb[off+2*i]
+        hi = bb[off+2*i+1]
+        if lo < 0: lo &= 0xff
+        if hi < 0: hi &= 0xff
+        if high is None:
+            high = hi
+        else:
+            if hi != high:
+                return False
+        if seen[lo]:
+            return False
+        seen[lo] = True
+    return True
+
+def _identity_check_bytes(bb, off):
+    """
+    Check for identity sequence 00..FF at offset.
+
+    :param bb: Buffer to inspect
+    :type bb: bytearray
+    :param off: Offset into buffer
+    :type off: int
+    :return: True if identity
+    :rtype: bool
+    """
+
+    for i in range(256):
+        v = bb[off+i]
+        if v < 0: v &= 0xff
+        if v != (i & 0xff):
+            return False
+    return True
+
+def _identity_check_words(bb, off):
+    """
+    Check for identity word table 0000, 0100, ..., FF00.
+
+    :param bb: Buffer to inspect
+    :type bb: bytearray
+    :param off: Offset into buffer
+    :type off: int
+    :return: True if identity words
+    :rtype: bool
+    """
+
+    for i in range(256):
+        lo = bb[off+2*i]
+        hi = bb[off+2*i+1]
+        if lo < 0: lo &= 0xff
+        if hi < 0: hi &= 0xff
+        if lo != (i & 0xff) or hi != 0x00:
+            return False
+    return True
+
+def is_256_permutation(bb, off=0):
+    """
+    Backward-compatible byte permutation check for 0..255.
+
+    :param bb: Buffer to inspect
+    :type bb: bytearray
+    :param off: Offset into buffer
+    :type off: int
+    :return: True if permutation
+    :rtype: bool
+    """
+
+    if bb is None or off+256 > len(bb): return False
+    return _perm_check_bytes(bb, off)
+
 def decompile_function(func, timeout=DECOMP_TIMEOUT):
+    """
+    Decompile a function and return the recovered C as a string.
+
+    :param func: Function to decompile
+    :type func: ghidra.program.model.listing.Function
+    :param timeout: Timeout seconds
+    :type timeout: int
+    :return: Decompiled C text or None
+    :rtype: str
+    """
+
     try:
         ifc = DecompInterface()
         ifc.openProgram(currentProgram)
@@ -127,19 +270,21 @@ def decompile_function(func, timeout=DECOMP_TIMEOUT):
         return None
 
 def find_256_tables():
-    """find256_tables attempts to look for potential S-Box like data
-
-    RC4 utilizes 256 S-box data. We scan through chunks and
-    check if any boxes contain permutations of bytes i.e no duplicate
-    bytes are found within a block which is necessary for RC4.
-
-    This runs in O(N^2) so it could take a bit!
     """
+    Scan initialized memory for RC4-like tables:
+      - 256-byte permutation (any order)
+      - 256-byte identity sequence 00..FF
+      - 512-byte word table where low bytes form permutation and high bytes constant
+      - 512-byte identity word table 0000..FF00
+
+    :return: List of addresses of candidate tables
+    :rtype: list
+    """
+
     results = []
     for blk in memory.getBlocks():
         if not blk.isInitialized():
             continue
-
         start = blk.getStart()
         size = blk.getSize()
         off = 0
@@ -150,23 +295,38 @@ def find_256_tables():
             if bb is None:
                 off += chunk
                 continue
-
-            i = 0
             L = len(bb)
 
+            i = 0
             while i + 256 <= L:
-                if is_256_permutation(bb, i):
+                if _perm_check_bytes(bb, i) or _identity_check_bytes(bb, i):
                     addr = base.add(i)
                     results.append(addr)
-                    note(addr, BOOKMARK_TABLE, "RC4_SBOX", "256-byte permutation (S[] candidate)")
+                    note(addr, BOOKMARK_TABLE, "RC4_SBOX", "256-byte table (perm or identity) candidate")
                     i += 256
                     continue
                 i += 1
+
+            j = 0
+            while j + 512 <= L:
+                if _perm_check_words_lowbyte(bb, j) or _identity_check_words(bb, j):
+                    addrw = base.add(j)
+                    results.append(addrw)
+                    note(addrw, BOOKMARK_TABLE, "RC4_SBOX16", "512-byte word table (low-byte perm or identity) candidate")
+                    j += 512
+                    continue
+                j += 2
             off += chunk
     return results
 
 def find_aes_rcon_and_sboxes():
-    """Find AES S-BOX and other structures."""
+    """
+    Find AES S-box, inverse S-box, and Rcon sequences.
+
+    :return: List of hits with type tags
+    :rtype: list
+    """
+
     hits = []
     for blk in memory.getBlocks():
         if not blk.isInitialized(): continue
@@ -195,13 +355,14 @@ def find_aes_rcon_and_sboxes():
 
 def mark_rc4_instr_patterns(func):
     """
-    Scan function instructions and add bookmarks on instructions that match RC4-like patterns:
-    - CMP #0x100 or CMP #256
-    - AND #0xFF
-    - MOV.B with indexed addressing (array access)
-    - ADD.B reading from memory (S[i] or key bytes) into a register (j update)
-    - Swap-like sequences: sequence of MOV.B that move between memory and registers
+    Bookmark assembly instructions that resemble RC4 KSA or PRGA.
+
+    :param func: Function to scan
+    :type func: ghidra.program.model.listing.Function
+    :return: Hit count
+    :rtype: int
     """
+
     try:
         instrs = listing.getInstructions(func.getBody(), True)
     except:
@@ -245,10 +406,14 @@ def mark_rc4_instr_patterns(func):
 
 def mark_xtea_instr_patterns(func):
     """
-    Bookmark instructions referencing TEA/XTEA delta constants and ARX operations.
-    - Immediate constant 0x9E3779B9 or 0xC6EF3720 (seen as decimal too)
-    - ADD/PLUS and XOR sequences
+    Bookmark instructions referencing TEA/XTEA constants or ARX operations.
+
+    :param func: Function to scan
+    :type func: ghidra.program.model.listing.Function
+    :return: Hit count
+    :rtype: int
     """
+
     hits = 0
     try:
         instrs = listing.getInstructions(func.getBody(), True)
@@ -266,7 +431,15 @@ def mark_xtea_instr_patterns(func):
     return hits
 
 def mark_prng_instr_patterns(func):
-    """Bookmark instructions containing PRNG constants (Park-Miller, Knuth)."""
+    """
+    Bookmark instructions containing PRNG constants (Park-Miller, Knuth, LCG).
+
+    :param func: Function to scan
+    :type func: ghidra.program.model.listing.Function
+    :return: Hit count
+    :rtype: int
+    """
+
     hits = 0
     try:
         instrs = listing.getInstructions(func.getBody(), True)
@@ -287,7 +460,15 @@ def mark_prng_instr_patterns(func):
     return hits
 
 def detect_rc4_in_decomp(ctext):
-    """Brittle attempt to find rc4 heuristics in C decompilation"""
+    """
+    Detect RC4-like KSA or PRGA patterns in decompiled C text.
+
+    :param ctext: Decompiled C text
+    :type ctext: str
+    :return: Tuple (ksa_found, prga_found)
+    :rtype: tuple
+    """
+
     if ctext is None:
         return (False, False)
     low = ctext.lower()
@@ -296,7 +477,15 @@ def detect_rc4_in_decomp(ctext):
     return (bool(ksa), bool(prga))
 
 def find_static_key_from_decomp(ctext):
-    """Attempt to locate a static key in decompilation near potential crypto funcs."""
+    """
+    Try to locate a static key array referenced by decompiled code.
+
+    :param ctext: Decompiled C text
+    :type ctext: str
+    :return: Dict with name, addr, bytes or None
+    :rtype: dict
+    """
+
     if ctext is None: return None
     low = ctext.lower()
     m = RE_KEY_MOD.search(low)
@@ -324,7 +513,15 @@ def find_static_key_from_decomp(ctext):
     return None
 
 def rc4_ksa_emulate(key_bytes):
-    """emulate KSA rc4"""
+    """
+    Emulate RC4 KSA to produce a 256-byte state S for a given key.
+
+    :param key_bytes: Key byte array or string
+    :type key_bytes: list or str or bytearray
+    :return: S array as list of ints
+    :rtype: list
+    """
+
     S = list(range(256)); j = 0; klen = len(key_bytes)
     if klen == 0:
         return S
@@ -342,6 +539,17 @@ def rc4_ksa_emulate(key_bytes):
     return S
 
 def compare_emulated_to_table(emuS, table_addr):
+    """
+    Compare an emulated S array to a 256-byte table at table_addr.
+
+    :param emuS: Emulated S array
+    :type emuS: list
+    :param table_addr: Address of 256-byte table
+    :type table_addr: Address
+    :return: True if equal
+    :rtype: bool
+    """
+
     obs = read_bytes(table_addr, 256)
     if obs is None: return False
     for i in range(256):
@@ -355,7 +563,15 @@ def compare_emulated_to_table(emuS, table_addr):
 # ---------------- RC4-like variants: VMPC and RC4A ----------------
 
 def _count_indexed_arrays_in_text(low_text):
-    """Extract and count array identifiers used with bracket indexing in decompiled text."""
+    """
+    Count array identifiers used in bracket indexing in decompiled text.
+
+    :param low_text: Lowercased C text
+    :type low_text: str
+    :return: Map of name to count
+    :rtype: dict
+    """
+
     names = RE_INDEXED_ARRAY.findall(low_text)
     counts = {}
     for n in names:
@@ -364,36 +580,39 @@ def _count_indexed_arrays_in_text(low_text):
 
 def detect_vmpc_in_decomp(ctext):
     """
-    VMPC heuristic for messy decompile text:
-      - Signs of nested indexing like a[ a[ i ] + ... ] or general [ ... [ ... ] ... ]
-      - Many bracketed expressions that are used to produce another index
-    This is intentionally loose to tolerate Ghidra output changes.
+    Heuristic VMPC detection in messy decompiled text.
+
+    :param ctext: Decompiled C text
+    :type ctext: str
+    :return: True if likely VMPC-like
+    :rtype: bool
     """
+
     if ctext is None:
         return False
     low = ctext.lower()
-    # look for any nested bracket use
     nested_hit = RE_NESTED_ARRAY.search(low) is not None
-    # require at least one mask to byte or mod 256 nearby to suggest RC4-like byte domain
     mask_hit = ("& 0xff" in low) or ("% 256" in low) or ("&0xff" in low)
-    # require at least some array indexing activity
     arr_counts = _count_indexed_arrays_in_text(low)
     has_arrays = sum(arr_counts.values()) >= 6
     return bool(nested_hit and mask_hit and has_arrays)
 
 def detect_rc4a_in_decomp(ctext):
     """
-    RC4A heuristic for messy decompile text:
-      - Presence of two heavily used array identifiers accessed as arrays
-      - Optional xor between two indexed arrays
+    Heuristic RC4A detection in messy decompiled text.
+
+    :param ctext: Decompiled C text
+    :type ctext: str
+    :return: True if likely RC4A-like
+    :rtype: bool
     """
+
     if ctext is None:
         return False
     low = ctext.lower()
     arr_counts = _count_indexed_arrays_in_text(low)
     if len(arr_counts) < 2:
         return False
-    # find top two arrays by count
     tops = sorted(arr_counts.items(), key=lambda x: -x[1])[:2]
     two_heavy = len(tops) == 2 and tops[0][1] >= 3 and tops[1][1] >= 3
     xor_two_arrays = RE_ARRAY_XOR.search(low) is not None
@@ -401,12 +620,14 @@ def detect_rc4a_in_decomp(ctext):
 
 def mark_vmpc_rc4a_instr_patterns(func):
     """
-    Instruction-level bookmarks for VMPC/RC4A hints.
-    Heuristics:
-      - multiple MOV.B using indexed memory in a tight window
-      - arithmetic on values freshly loaded from memory (possible indirect index)
-      - if many indexed ops appear, mark window
+    Bookmark instruction windows suggesting VMPC or RC4A.
+
+    :param func: Function to scan
+    :type func: ghidra.program.model.listing.Function
+    :return: Hit count
+    :rtype: int
     """
+
     try:
         instrs = listing.getInstructions(func.getBody(), True)
     except:
@@ -435,9 +656,16 @@ def mark_vmpc_rc4a_instr_patterns(func):
 
 def find_adjacent_256_table_pairs(tables, max_gap=64):
     """
-    Find pairs of 256-byte permutations located near each other.
-    Useful heuristic for RC4A which uses two S arrays.
+    Find pairs of 256-byte tables near each other, hinting RC4A S1/S2.
+
+    :param tables: List of 256-table addresses
+    :type tables: list
+    :param max_gap: Maximum gap bytes between tables
+    :type max_gap: int
+    :return: List of tuple pairs
+    :rtype: list
     """
+
     offs = [(t, t.getOffset()) for t in tables]
     offs_sorted = sorted(offs, key=lambda x: x[1])
     pairs = []
@@ -452,9 +680,16 @@ def find_adjacent_256_table_pairs(tables, max_gap=64):
 
 def mark_rc4_like_variants_in_function(func, ctext):
     """
-    Run both decomp heuristics and instruction-level patterning for RC4-like variants.
-    Returns a dict with flags for summary.
+    Run decomp and instruction heuristics for RC4-like variants.
+
+    :param func: Function to scan
+    :type func: ghidra.program.model.listing.Function
+    :param ctext: Decompiled C text
+    :type ctext: str
+    :return: Dict with flags and counts
+    :rtype: dict
     """
+
     res = {"vmpc": False, "rc4a": False, "instr_hits": 0}
     try:
         if ctext:
@@ -476,11 +711,21 @@ def mark_rc4_like_variants_in_function(func, ctext):
     return res
 
 def analyze_functions_marking(tables):
+    """
+    Decompile and annotate functions with crypto and PRNG heuristics.
+
+    :param tables: List of 256-table addresses
+    :type tables: list
+    :return: Summary counts
+    :rtype: dict
+    """
+
     rc4_c_count = 0
     xtea_count = 0
     prng_func_count = 0
     vmpc_count = 0
     rc4a_func_count = 0
+    modulo_total = 0
     for f in fm.getFunctions(True):
         try:
             ctext = decompile_function(f)
@@ -489,31 +734,35 @@ def analyze_functions_marking(tables):
                 if ksa or prga:
                     note(f.getEntryPoint(), BOOKMARK_RC4, "RC4_C", "RC4-like (decomp): KSA=%s PRGA=%s" % (str(ksa), str(prga)))
                     rc4_c_count += 1
-                # RC4-like variants
                 var_res = mark_rc4_like_variants_in_function(f, ctext)
                 if var_res.get("vmpc"):
                     vmpc_count += 1
                 if var_res.get("rc4a"):
                     rc4a_func_count += 1
-                # Mark instructions in the function that match RC4 heuristics
                 mark_rc4_instr_patterns(f)
-                # XTEA by decomp heuristic
                 if RE_XTEA_ARX.search(ctext):
                     note(f.getEntryPoint(), BOOKMARK_XTEA, "XTEA_FUNC", "XTEA/TEA-like (decompiler pattern)")
                     xtea_count += 1
-                # Decomp PRNG hints
                 if RE_PRNG_PM.search(ctext) or RE_PRNG_KNUTH.search(ctext) or RE_LCG.search(ctext):
                     note(f.getEntryPoint(), BOOKMARK_PRNG, "PRNG_FUNC", "PRNG-like pattern in decompiler")
                     prng_func_count += 1
-            # Independent instruction-level passes (always run)
             mark_xtea_instr_patterns(f)
             mark_prng_instr_patterns(f)
+            modulo_total += mark_modulo_patterns(f)
         except:
             pass
-    return {"rc4_c": rc4_c_count, "xtea": xtea_count, "prng_funcs": prng_func_count, "vmpc": vmpc_count, "rc4a": rc4a_func_count}
+    return {"rc4_c": rc4_c_count, "xtea": xtea_count, "prng_funcs": prng_func_count, "vmpc": vmpc_count, "rc4a": rc4a_func_count, "mod_hits": modulo_total}
 
 def detect_rc4_asm_in_function(func):
-    """Look for rc4 heuristic instructions."""
+    """
+    Score a function for RC4-like assembly patterns.
+
+    :param func: Function to scan
+    :type func: ghidra.program.model.listing.Function
+    :return: Dict with score, flags, and pcs list
+    :rtype: dict
+    """
+
     score = 0
     flags = set()
     pcs = []
@@ -554,7 +803,13 @@ def detect_rc4_asm_in_function(func):
     return {"score": score, "flags": flags, "pcs": pcs}
 
 def rc4_asm_scan_and_mark():
-    """Mark anything with score over 5 for now."""
+    """
+    Annotate functions that score high on RC4-like assembly patterns.
+
+    :return: Count of functions marked
+    :rtype: int
+    """
+
     total=0
     for f in fm.getFunctions(True):
         try:
@@ -569,7 +824,13 @@ def rc4_asm_scan_and_mark():
     return total
 
 def scan_constants_and_prngs_and_mark():
-    """Looks for constants associatied with certain ciphers and rng"""
+    """
+    Scan initialized memory and instructions for PRNG and crypto-related constants.
+
+    :return: Dict with data hits and instruction hits
+    :rtype: dict
+    """
+
     results = []
     needles = {
         PM_IA: "Park-Miller IA", PM_IM: "Park-Miller IM",
@@ -578,7 +839,6 @@ def scan_constants_and_prngs_and_mark():
         TEA_DELTA: "TEA delta", TEA_SUM32: "TEA sum32",
         CRC32_POLY: "CRC32 poly"
     }
-    # Build 4-byte little endian patterns
     le_map = {}
     int_types = (int,)
     for const_val, name in needles.items():
@@ -586,7 +846,6 @@ def scan_constants_and_prngs_and_mark():
             continue
         b = bytearray([(const_val & 0xff), ((const_val>>8)&0xff), ((const_val>>16)&0xff), ((const_val>>24)&0xff)])
         le_map[bytes(b)] = (const_val, name)
-    # Scan initialized blocks
     for blk in memory.getBlocks():
         if not blk.isInitialized(): continue
         base = blk.getStart(); size = blk.getSize(); off=0
@@ -606,7 +865,6 @@ def scan_constants_and_prngs_and_mark():
                     note(addr, BOOKMARK_PRNG, "CONST", "Constant 0x%08x (%s) found in data" % (val, name))
                     results.append((addr, val, name))
             off += chunk
-    # Instruction-level PRNG constant bookmarks too..
     prng_instr_hits = 0
     for f in fm.getFunctions(True):
         try:
@@ -621,7 +879,15 @@ def scan_constants_and_prngs_and_mark():
     return {"data": results, "instr_hits": prng_instr_hits}
 
 def func_accesses_io(func):
-    """Look for IO serial access and mark it."""
+    """
+    Bookmark instructions that touch known IO registers.
+
+    :param func: Function to scan
+    :type func: ghidra.program.model.listing.Function
+    :return: List of (addr, regname) hits
+    :rtype: list
+    """
+
     hits=[]
     try:
         for ins in listing.getInstructions(func.getBody(), True):
@@ -636,12 +902,12 @@ def func_accesses_io(func):
 
 def find_crc16_constants():
     """
-    Scan memory for CRC-16 constants/polynomials in little endian.
-    Common ones:
-      - CRC16-IBM:    0x8005  -> bytes: 05 80
-      - CRC16-CCITT:  0x1021  -> bytes: 21 10
-      - CRC16-MODBUS: 0xA001  -> bytes: 01 A0
+    Scan initialized memory for common CRC16 polynomials in little endian.
+
+    :return: List of addresses where CRC16 poly bytes occur
+    :rtype: list
     """
+
     CRC16_POLYS = {
         "\x05\x80": "CRC16_IBM (0x8005)",
         "\x21\x10": "CRC16_CCITT (0x1021)",
@@ -671,7 +937,237 @@ def find_crc16_constants():
             off += chunk
     return hits
 
+# ---------- Runtime RC4 S detection (ASM-based) ----------
+
+def _parse_imm(valstr):
+    """
+    Parse an immediate string which may be hex or decimal.
+
+    :param valstr: Immediate literal like 0x100 or 256
+    :type valstr: str
+    :return: Integer value or None
+    :rtype: int
+    """
+
+    try:
+        if valstr.startswith("0x") or valstr.startswith("0X"):
+            return int(valstr, 16)
+        return int(valstr)
+    except:
+        return None
+
+def _find_recent_base_for_reg(func, regname, start_addr, search_back=40):
+    """
+    Scan backward in the function for a MOV #imm, reg that sets base.
+
+    :param func: Function to scan
+    :type func: ghidra.program.model.listing.Function
+    :param regname: Register name like r12
+    :type regname: str
+    :param start_addr: Starting address to search backward from
+    :type start_addr: Address
+    :param search_back: Max instructions to look back
+    :type search_back: int
+    :return: Base address int or None
+    :rtype: int
+    """
+
+    try:
+        instrs = listing.getInstructions(func.getBody(), True)
+    except:
+        return None
+    ins_list = []
+    for ins in instrs:
+        ins_list.append(ins)
+    idx = -1
+    for i in range(len(ins_list)):
+        if ins_list[i].getAddress() == start_addr:
+            idx = i
+            break
+    if idx < 0:
+        return None
+    lo = max(0, idx - search_back)
+    for j in range(idx-1, lo-1, -1):
+        s = ins_list[j].toString().lower()
+        m = RE_MOV_IMM_TO_REG.search(s)
+        if m:
+            imm = m.group(2)
+            reg = m.group(3).lower()
+            if reg == regname.lower():
+                val = _parse_imm(imm)
+                return val
+    return None
+
+def find_rc4_state_in_ram():
+    """
+    Detect runtime S initialization buffers by scanning stores and loop bounds.
+
+    :return: List of tuples (kind, addr) where kind is byte or word
+    :rtype: list
+    """
+
+    runtime_hits = []
+    for f in fm.getFunctions(True):
+        try:
+            instrs = listing.getInstructions(f.getBody(), True)
+        except:
+            continue
+        store_events = {}
+        cmp256_seen = False
+        for ins in instrs:
+            s = ins.toString().lower()
+            a = ins.getAddress()
+            if RE_CMP_256.search(s):
+                cmp256_seen = True
+            mb = RE_MOVB_STORE_IDX.search(s)
+            if mb:
+                off_str, reg = mb.group(1), mb.group(2)
+                try:
+                    off_val = int(off_str)
+                except:
+                    off_val = 0
+                key = ("byte", reg.lower())
+                arr = store_events.get(key, [])
+                arr.append((a, off_val))
+                store_events[key] = arr
+                continue
+            mw = RE_MOVW_STORE_IDX.search(s)
+            if mw:
+                off_str, reg = mw.group(2), mw.group(3)
+                try:
+                    off_val = int(off_str)
+                except:
+                    off_val = 0
+                key = ("word", reg.lower())
+                arr = store_events.get(key, [])
+                arr.append((a, off_val))
+                store_events[key] = arr
+                continue
+        for (kind, reg), evts in store_events.items():
+            if len(evts) < 32:
+                continue
+            offs = sorted(set([o for (_,o) in evts]))
+            if kind == "byte":
+                min_off = min(offs); max_off = max(offs)
+                cover = (max_off - min_off + 1)
+                dense = (cover >= 200) and (len(offs) >= 128)
+                if dense and cmp256_seen:
+                    base_addr_val = _find_recent_base_for_reg(f, reg, evts[0][0])
+                    if base_addr_val is not None:
+                        addr = toAddr(base_addr_val + min_off)
+                        note(addr, BOOKMARK_TABLE, "RC4_SBOX_RUNTIME", "Runtime RC4 S[] buffer candidate at base reg %s" % reg)
+                        runtime_hits.append(("byte", addr))
+                    else:
+                        note(f.getEntryPoint(), BOOKMARK_TABLE, "RC4_SBOX_RUNTIME", "Runtime RC4 S[] via %s offsets; base unresolved" % reg)
+                        runtime_hits.append(("byte", None))
+            else:
+                even = all((o % 2) == 0 for o in offs[:64])
+                if even and cmp256_seen and (max(offs) >= 300):
+                    base_addr_val = _find_recent_base_for_reg(f, reg, evts[0][0])
+                    if base_addr_val is not None:
+                        addr = toAddr(base_addr_val + min(offs))
+                        note(addr, BOOKMARK_TABLE, "RC4_SBOX_RUNTIME16", "Runtime RC4 S[] word buffer candidate at base reg %s" % reg)
+                        runtime_hits.append(("word", addr))
+                    else:
+                        note(f.getEntryPoint(), BOOKMARK_TABLE, "RC4_SBOX_RUNTIME16", "Runtime RC4 S[] word via %s; base unresolved" % reg)
+                        runtime_hits.append(("word", None))
+    return runtime_hits
+
+# ---------- Global modulo pattern detection ----------
+
+def _is_power_of_two_minus_one(mask):
+    """
+    Test if mask is of form (2^n - 1).
+
+    :param mask: Integer mask
+    :type mask: int
+    :return: True if mask is 2^n - 1
+    :rtype: bool
+    """
+
+    if mask < 1:
+        return False
+    return ((mask + 1) & mask) == 0
+
+def mark_modulo_patterns(func):
+    """
+    Detect modulo-like operations in assembly: mask, div remainder, subtract loops, shift+mask.
+
+    :param func: Function to scan
+    :type func: ghidra.program.model.listing.Function
+    :return: Number of modulo-related bookmarks added
+    :rtype: int
+    """
+
+    hits = 0
+    try:
+        instrs = listing.getInstructions(func.getBody(), True)
+    except:
+        return 0
+    # collect a small sliding window to relate cmp/sub and shift/mask
+    window = []
+    for ins in instrs:
+        s = ins.toString().lower()
+        a = ins.getAddress()
+        window.append((a, s))
+        if len(window) > 8:
+            window.pop(0)
+
+        # Masking mod: AND #((2^n)-1)
+        m = RE_AND_IMM.search(s)
+        if m:
+            imm = m.group(2)
+            val = _parse_imm(imm)
+            if val is not None and _is_power_of_two_minus_one(val):
+                nplus = val + 1
+                note(a, BOOKMARK_MOD, "MOD_MASK", "AND with mask 0x%X implies mod %d" % (val, nplus))
+                hits += 1
+
+        # Division based mod: calls to __div, __divu, __mod, __rem
+        if RE_CALL_DIV.search(s):
+            note(a, BOOKMARK_MOD, "MOD_DIVCALL", "Division/mod call used (remainder likely used as modulus)")
+            hits += 1
+
+        # Subtract loop mod: CMP #N then SUB #N on same register nearby
+        mc = RE_CMP_IMM_REG.search(s)
+        if mc:
+            n_imm = _parse_imm(mc.group(2))
+            regc = mc.group(3)
+            # search forward a few instructions for SUB #same, reg
+            for (aa, ss) in window[-1:]:
+                pass  # keep lint quiet
+        # check recent window for cmp/sub sequence
+        for (aa, ss) in window:
+            subm = RE_SUB_IMM_REG.search(ss)
+            if subm and mc:
+                n2 = _parse_imm(subm.group(2))
+                regs = subm.group(3)
+                if n_imm is not None and n2 is not None and regs == regc and n2 == n_imm:
+                    note(ins.getAddress(), BOOKMARK_MOD, "MOD_SUBLOOP", "CMP and SUB of same constant suggest modulo by %d" % n_imm)
+                    hits += 1
+                    break
+
+        # Shift plus mask: look for shift in window and power-of-two mask
+        if RE_SHIFT.search(s):
+            # see if a mask follows soon
+            for (wa, ws) in window:
+                mm = RE_AND_IMM.search(ws)
+                if mm:
+                    mv = _parse_imm(mm.group(2))
+                    if mv is not None and _is_power_of_two_minus_one(mv):
+                        note(wa, BOOKMARK_MOD, "MOD_SHIFTMASK", "Shift and AND 0x%X imply modulo %d" % (mv, mv+1))
+                        hits += 1
+                        break
+    return hits
+
 def main():
+    """
+    Entry point: run scans, annotate program, and show summary.
+
+    :return: None
+    :rtype: None
+    """
+
     print("==== [D430] Crypto Scanner =====")
     start = time.time()
     note(currentProgram.getMinAddress(), BOOKMARK_CRYPTO, "Info", "D430 Scanner mark.")
@@ -682,14 +1178,18 @@ def main():
     aes_hits = find_aes_rcon_and_sboxes()
     crc16_hits = find_crc16_constants()
 
-    # Look for adjacent S-boxes as RC4A hint
+    # RC4A hint: adjacent S-boxes
     rc4a_pairs = find_adjacent_256_table_pairs(tables)
+
+    # Runtime S detection (ASM-based)
+    print("[D430] Scanning for runtime RC4 S initialization")
+    runtime_s_hits = find_rc4_state_in_ram()
 
     # Prng constants scan
     print("[D430] Scanning for constants")
     prng_res = scan_constants_and_prngs_and_mark()
 
-    # Function-level decomp and instr marking
+    # Function-level decomp and instr marking (also runs global modulo detection)
     func_summary = analyze_functions_marking(tables)
 
     # ASM-only RC4 detection (marks instrs in functions too)
@@ -698,7 +1198,6 @@ def main():
 
     # USCI scan
     usci_count = 0
-    mods = {}
     io_hits_total = 0
     for f in fm.getFunctions(True):
         hits = func_accesses_io(f)
@@ -710,7 +1209,8 @@ def main():
     lines = []
     lines.append("D430 scan complete in %.2f s" % (elapsed,))
     lines.append("CRC16 constants found: %d" % (len(crc16_hits),))
-    lines.append("RC4 S[] tables: %d" % (len(tables),))
+    lines.append("RC4 S[] tables (static): %d" % (len(tables),))
+    lines.append("RC4 S[] runtime buffers: %d" % (len(runtime_s_hits),))
     lines.append("RC4A S-box pairs: %d" % (len(rc4a_pairs),))
     lines.append("AES/Rcon hits: %d" % (len(aes_hits),))
     lines.append("PRNG constant data hits: %d" % (len(prng_res.get("data", [])),))
@@ -718,6 +1218,7 @@ def main():
     lines.append("RC4 (decompiler) functions: %d" % (func_summary.get("rc4_c",0),))
     lines.append("VMPC-like functions: %d" % (func_summary.get("vmpc",0),))
     lines.append("RC4A-like functions: %d" % (func_summary.get("rc4a",0),))
+    lines.append("Modulo pattern bookmarks: %d" % (func_summary.get("mod_hits",0),))
     lines.append("RC4 (ASM instr) detections (functions): %d" % rc4_asm_hits)
     lines.append("XTEA-like functions: %d" % (func_summary.get("xtea",0),))
     lines.append("Functions with USCI I/O hits: %d (IO bookmarks: %d)" % (usci_count, io_hits_total))
