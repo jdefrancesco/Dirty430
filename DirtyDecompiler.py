@@ -4,11 +4,10 @@
 # @author J. DeFrancesco
 # @category MSP430
 
-from ghidra.util import Msg
 from ghidra.app.decompiler import DecompInterface
 from ghidra.program.model.pcode import PcodeOp
 from ghidra.util.task import ConsoleTaskMonitor
-from ghidra.app.decompiler import ClangTokenGroup, ClangToken
+from ghidra.app.decompiler import ClangTokenGroup
 from javax.swing import JOptionPane, JScrollPane, JTextArea
 import re
 

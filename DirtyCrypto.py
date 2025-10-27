@@ -6,7 +6,9 @@
 # - XTEA/TEA heuristics (constants and ARX patterns)
 # - CRC table heuristics
 # - PRNG detection (Knuth subtractive, NR ran1, RANDU, LCG)
-# - Correlation with radio I/O (UCAx/UCBx TX/RXBUF, P1OUT..P4OUT)
+# - RC4-like variants: VMPC and RC4A heuristics
+# - Global modulo pattern detection (mask/div/sub/shift+mask)
+# - Runtime S[] detection (detect writes to RAM that populate 256-byte tables)
 # - Adds Bookmarks and Plate comments (no renaming/modification)
 #
 #@category DataCrypto
@@ -21,7 +23,6 @@ from javax.swing import JOptionPane, JScrollPane, JTextArea
 
 import re, time
 
-# ---------- Configuration ----------
 BOOKMARK_CRYPTO     = "CRYPTO"
 BOOKMARK_RC4        = "CRYPTO_RC4"
 BOOKMARK_PRNG       = "CRYPTO_PRNG"
@@ -50,7 +51,6 @@ PM_IR = 2836
 KNUTH_MBIG  = 1000000000
 KNUTH_MSEED = 161803398
 
-# I/O register hints (MSP430F5438 common)
 IO_REGS = {
     "UCA0RXBUF": 0x05C6, "UCA0TXBUF": 0x05C7,
     "UCB0RXBUF": 0x05DD, "UCB0TXBUF": 0x05DE,
@@ -274,7 +274,7 @@ def find_256_tables():
     Scan initialized memory for RC4-like tables:
       - 256-byte permutation (any order)
       - 256-byte identity sequence 00..FF
-      - 512-byte word table where low bytes form permutation and high bytes constant
+      - 512-byte word table whose low bytes form a permutation; high bytes constant
       - 512-byte identity word table 0000..FF00
 
     :return: List of addresses of candidate tables
@@ -355,7 +355,7 @@ def find_aes_rcon_and_sboxes():
 
 def mark_rc4_instr_patterns(func):
     """
-    Bookmark assembly instructions that resemble RC4 KSA or PRGA.
+    Scan function instructions and add bookmarks on instructions that match RC4-like patterns.
 
     :param func: Function to scan
     :type func: ghidra.program.model.listing.Function
@@ -406,7 +406,7 @@ def mark_rc4_instr_patterns(func):
 
 def mark_xtea_instr_patterns(func):
     """
-    Bookmark instructions referencing TEA/XTEA constants or ARX operations.
+    Bookmark instructions referencing TEA/XTEA delta constants and ARX operations.
 
     :param func: Function to scan
     :type func: ghidra.program.model.listing.Function
@@ -432,7 +432,7 @@ def mark_xtea_instr_patterns(func):
 
 def mark_prng_instr_patterns(func):
     """
-    Bookmark instructions containing PRNG constants (Park-Miller, Knuth, LCG).
+    Bookmark instructions containing PRNG constants (Park-Miller, Knuth).
 
     :param func: Function to scan
     :type func: ghidra.program.model.listing.Function
@@ -559,8 +559,6 @@ def compare_emulated_to_table(emuS, table_addr):
         if (emuS[i] & 0xff) != (vi & 0xff):
             return False
     return True
-
-# ---------------- RC4-like variants: VMPC and RC4A ----------------
 
 def _count_indexed_arrays_in_text(low_text):
     """
@@ -710,48 +708,97 @@ def mark_rc4_like_variants_in_function(func, ctext):
         pass
     return res
 
-def analyze_functions_marking(tables):
+def _parse_imm(valstr):
     """
-    Decompile and annotate functions with crypto and PRNG heuristics.
+    Parse an immediate string which may be hex or decimal.
 
-    :param tables: List of 256-table addresses
-    :type tables: list
-    :return: Summary counts
-    :rtype: dict
+    :param valstr: Immediate literal like 0x100 or 256
+    :type valstr: str
+    :return: Integer value or None
+    :rtype: int
     """
 
-    rc4_c_count = 0
-    xtea_count = 0
-    prng_func_count = 0
-    vmpc_count = 0
-    rc4a_func_count = 0
-    modulo_total = 0
-    for f in fm.getFunctions(True):
-        try:
-            ctext = decompile_function(f)
-            if ctext:
-                ksa, prga = detect_rc4_in_decomp(ctext)
-                if ksa or prga:
-                    note(f.getEntryPoint(), BOOKMARK_RC4, "RC4_C", "RC4-like (decomp): KSA=%s PRGA=%s" % (str(ksa), str(prga)))
-                    rc4_c_count += 1
-                var_res = mark_rc4_like_variants_in_function(f, ctext)
-                if var_res.get("vmpc"):
-                    vmpc_count += 1
-                if var_res.get("rc4a"):
-                    rc4a_func_count += 1
-                mark_rc4_instr_patterns(f)
-                if RE_XTEA_ARX.search(ctext):
-                    note(f.getEntryPoint(), BOOKMARK_XTEA, "XTEA_FUNC", "XTEA/TEA-like (decompiler pattern)")
-                    xtea_count += 1
-                if RE_PRNG_PM.search(ctext) or RE_PRNG_KNUTH.search(ctext) or RE_LCG.search(ctext):
-                    note(f.getEntryPoint(), BOOKMARK_PRNG, "PRNG_FUNC", "PRNG-like pattern in decompiler")
-                    prng_func_count += 1
-            mark_xtea_instr_patterns(f)
-            mark_prng_instr_patterns(f)
-            modulo_total += mark_modulo_patterns(f)
-        except:
-            pass
-    return {"rc4_c": rc4_c_count, "xtea": xtea_count, "prng_funcs": prng_func_count, "vmpc": vmpc_count, "rc4a": rc4a_func_count, "mod_hits": modulo_total}
+    try:
+        if valstr.startswith("0x") or valstr.startswith("0X"):
+            return int(valstr, 16)
+        return int(valstr)
+    except:
+        return None
+
+def _is_power_of_two_minus_one(mask):
+    """
+    Test if mask is of form (2^n - 1).
+
+    :param mask: Integer mask
+    :type mask: int
+    :return: True if mask is 2^n - 1
+    :rtype: bool
+    """
+
+    if mask < 1:
+        return False
+    return ((mask + 1) & mask) == 0
+
+def mark_modulo_patterns(func):
+    """
+    Detect modulo-like operations in assembly: mask, div remainder, subtract loops, shift+mask.
+
+    :param func: Function to scan
+    :type func: ghidra.program.model.listing.Function
+    :return: Number of modulo-related bookmarks added
+    :rtype: int
+    """
+
+    hits = 0
+    try:
+        instrs = listing.getInstructions(func.getBody(), True)
+    except:
+        return 0
+    window = []
+    for ins in instrs:
+        s = ins.toString().lower()
+        a = ins.getAddress()
+        window.append((a, s))
+        if len(window) > 8:
+            window.pop(0)
+
+        m = RE_AND_IMM.search(s)
+        if m:
+            imm = m.group(2)
+            val = _parse_imm(imm)
+            if val is not None and _is_power_of_two_minus_one(val):
+                nplus = val + 1
+                note(a, BOOKMARK_MOD, "MOD_MASK", "AND with mask 0x%X implies mod %d" % (val, nplus))
+                hits += 1
+
+        if RE_CALL_DIV.search(s):
+            note(a, BOOKMARK_MOD, "MOD_DIVCALL", "Division/mod call used (remainder likely used as modulus)")
+            hits += 1
+
+        mc = RE_CMP_IMM_REG.search(s)
+        if mc:
+            n_imm = _parse_imm(mc.group(2))
+            regc = mc.group(3)
+            for (aa, ss) in window[-4:]:
+                subm = RE_SUB_IMM_REG.search(ss)
+                if subm:
+                    n2 = _parse_imm(subm.group(2))
+                    regs = subm.group(3)
+                    if n_imm is not None and n2 is not None and regs == regc and n2 == n_imm:
+                        note(aa, BOOKMARK_MOD, "MOD_SUBLOOP", "CMP and SUB of same constant suggest modulo by %d" % n_imm)
+                        hits += 1
+                        break
+
+        if RE_SHIFT.search(s):
+            for (wa, ws) in window:
+                mm = RE_AND_IMM.search(ws)
+                if mm:
+                    mv = _parse_imm(mm.group(2))
+                    if mv is not None and _is_power_of_two_minus_one(mv):
+                        note(wa, BOOKMARK_MOD, "MOD_SHIFTMASK", "Shift and AND 0x%X imply modulo %d" % (mv, mv+1))
+                        hits += 1
+                        break
+    return hits
 
 def detect_rc4_asm_in_function(func):
     """
@@ -939,23 +986,6 @@ def find_crc16_constants():
 
 # ---------- Runtime RC4 S detection (ASM-based) ----------
 
-def _parse_imm(valstr):
-    """
-    Parse an immediate string which may be hex or decimal.
-
-    :param valstr: Immediate literal like 0x100 or 256
-    :type valstr: str
-    :return: Integer value or None
-    :rtype: int
-    """
-
-    try:
-        if valstr.startswith("0x") or valstr.startswith("0X"):
-            return int(valstr, 16)
-        return int(valstr)
-    except:
-        return None
-
 def _find_recent_base_for_reg(func, regname, start_addr, search_back=40):
     """
     Scan backward in the function for a MOV #imm, reg that sets base.
@@ -994,8 +1024,12 @@ def _find_recent_base_for_reg(func, regname, start_addr, search_back=40):
             imm = m.group(2)
             reg = m.group(3).lower()
             if reg == regname.lower():
-                val = _parse_imm(imm)
-                return val
+                try:
+                    if imm.startswith("0x") or imm.startswith("0X"):
+                        return int(imm, 16)
+                    return int(imm)
+                except:
+                    return None
     return None
 
 def find_rc4_state_in_ram():
@@ -1073,92 +1107,48 @@ def find_rc4_state_in_ram():
                         runtime_hits.append(("word", None))
     return runtime_hits
 
-# ---------- Global modulo pattern detection ----------
-
-def _is_power_of_two_minus_one(mask):
+def analyze_functions_marking(tables):
     """
-    Test if mask is of form (2^n - 1).
+    Decompile and annotate functions with crypto and PRNG heuristics.
 
-    :param mask: Integer mask
-    :type mask: int
-    :return: True if mask is 2^n - 1
-    :rtype: bool
+    :param tables: List of 256-table addresses
+    :type tables: list
+    :return: Summary counts
+    :rtype: dict
     """
 
-    if mask < 1:
-        return False
-    return ((mask + 1) & mask) == 0
-
-def mark_modulo_patterns(func):
-    """
-    Detect modulo-like operations in assembly: mask, div remainder, subtract loops, shift+mask.
-
-    :param func: Function to scan
-    :type func: ghidra.program.model.listing.Function
-    :return: Number of modulo-related bookmarks added
-    :rtype: int
-    """
-
-    hits = 0
-    try:
-        instrs = listing.getInstructions(func.getBody(), True)
-    except:
-        return 0
-    # collect a small sliding window to relate cmp/sub and shift/mask
-    window = []
-    for ins in instrs:
-        s = ins.toString().lower()
-        a = ins.getAddress()
-        window.append((a, s))
-        if len(window) > 8:
-            window.pop(0)
-
-        # Masking mod: AND #((2^n)-1)
-        m = RE_AND_IMM.search(s)
-        if m:
-            imm = m.group(2)
-            val = _parse_imm(imm)
-            if val is not None and _is_power_of_two_minus_one(val):
-                nplus = val + 1
-                note(a, BOOKMARK_MOD, "MOD_MASK", "AND with mask 0x%X implies mod %d" % (val, nplus))
-                hits += 1
-
-        # Division based mod: calls to __div, __divu, __mod, __rem
-        if RE_CALL_DIV.search(s):
-            note(a, BOOKMARK_MOD, "MOD_DIVCALL", "Division/mod call used (remainder likely used as modulus)")
-            hits += 1
-
-        # Subtract loop mod: CMP #N then SUB #N on same register nearby
-        mc = RE_CMP_IMM_REG.search(s)
-        if mc:
-            n_imm = _parse_imm(mc.group(2))
-            regc = mc.group(3)
-            # search forward a few instructions for SUB #same, reg
-            for (aa, ss) in window[-1:]:
-                pass  # keep lint quiet
-        # check recent window for cmp/sub sequence
-        for (aa, ss) in window:
-            subm = RE_SUB_IMM_REG.search(ss)
-            if subm and mc:
-                n2 = _parse_imm(subm.group(2))
-                regs = subm.group(3)
-                if n_imm is not None and n2 is not None and regs == regc and n2 == n_imm:
-                    note(ins.getAddress(), BOOKMARK_MOD, "MOD_SUBLOOP", "CMP and SUB of same constant suggest modulo by %d" % n_imm)
-                    hits += 1
-                    break
-
-        # Shift plus mask: look for shift in window and power-of-two mask
-        if RE_SHIFT.search(s):
-            # see if a mask follows soon
-            for (wa, ws) in window:
-                mm = RE_AND_IMM.search(ws)
-                if mm:
-                    mv = _parse_imm(mm.group(2))
-                    if mv is not None and _is_power_of_two_minus_one(mv):
-                        note(wa, BOOKMARK_MOD, "MOD_SHIFTMASK", "Shift and AND 0x%X imply modulo %d" % (mv, mv+1))
-                        hits += 1
-                        break
-    return hits
+    rc4_c_count = 0
+    xtea_count = 0
+    prng_func_count = 0
+    vmpc_count = 0
+    rc4a_func_count = 0
+    modulo_total = 0
+    for f in fm.getFunctions(True):
+        try:
+            ctext = decompile_function(f)
+            if ctext:
+                ksa, prga = detect_rc4_in_decomp(ctext)
+                if ksa or prga:
+                    note(f.getEntryPoint(), BOOKMARK_RC4, "RC4_C", "RC4-like (decomp): KSA=%s PRGA=%s" % (str(ksa), str(prga)))
+                    rc4_c_count += 1
+                var_res = mark_rc4_like_variants_in_function(f, ctext)
+                if var_res.get("vmpc"):
+                    vmpc_count += 1
+                if var_res.get("rc4a"):
+                    rc4a_func_count += 1
+                mark_rc4_instr_patterns(f)
+                if RE_XTEA_ARX.search(ctext):
+                    note(f.getEntryPoint(), BOOKMARK_XTEA, "XTEA_FUNC", "XTEA/TEA-like (decompiler pattern)")
+                    xtea_count += 1
+                if RE_PRNG_PM.search(ctext) or RE_PRNG_KNUTH.search(ctext) or RE_LCG.search(ctext):
+                    note(f.getEntryPoint(), BOOKMARK_PRNG, "PRNG_FUNC", "PRNG-like pattern in decompiler")
+                    prng_func_count += 1
+            mark_xtea_instr_patterns(f)
+            mark_prng_instr_patterns(f)
+            modulo_total += mark_modulo_patterns(f)
+        except:
+            pass
+    return {"rc4_c": rc4_c_count, "xtea": xtea_count, "prng_funcs": prng_func_count, "vmpc": vmpc_count, "rc4a": rc4a_func_count, "mod_hits": modulo_total}
 
 def main():
     """
@@ -1189,7 +1179,7 @@ def main():
     print("[D430] Scanning for constants")
     prng_res = scan_constants_and_prngs_and_mark()
 
-    # Function-level decomp and instr marking (also runs global modulo detection)
+    # Function-level decomp and instr marking 
     func_summary = analyze_functions_marking(tables)
 
     # ASM-only RC4 detection (marks instrs in functions too)
