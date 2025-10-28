@@ -4,101 +4,84 @@
 #@author J. DeFrancesco
 #@category MSP430 Strings
 
-from ghidra.program.model.data import DataUtilities, StringDataInstance, DataTypeConflictHandler
+
+from ghidra.program.model.data import StringDataType, DataUtilities
 from ghidra.program.model.symbol import SourceType
-from ghidra.program.model.listing import CodeUnit
+import string
 
-MIN_STR_LEN = 4  # Minimum characters to qualify as a string
+memory  = currentProgram.getMemory()
+listing = currentProgram.getListing()
+symtab  = currentProgram.getSymbolTable()
 
-def is_printable_ascii(byte_val):
+def is_printable_ascii(b):
+    """Return True if a byte is printable ASCII or space."""
+    return 32 <= b < 127
+
+def read_bytes(addr, count):
+    """Safely read bytes from memory."""
+    try:
+        bb = bytearray(count)
+        memory.getBytes(addr, bb)
+        return bb
+    except:
+        return None
+
+def create_string_at(addr, length, label_name=None):
     """
-    Check if a byte is a printable ASCII character.
+    Safely create an ASCII string at addr if region is free.
+    Clears conflicting data when safe, skips code.
     """
-    return 0x20 <= byte_val <= 0x7E
+    dt = StringDataType()
+    existing = listing.getDataAt(addr)
+    if existing:
+        # Already something defined here, skip
+        print("Skip 0x%s (already data: %s)" % (addr, existing))
+        return None
+    try:
+        DataUtilities.createData(
+            currentProgram, addr, dt, length, False,
+            DataUtilities.ClearDataMode.CLEAR_ALL_CONFLICT_DATA
+        )
+        if label_name:
+            symtab.createLabel(addr, label_name, SourceType.USER_DEFINED)
+        print("Created string at %s (%d bytes)" % (addr, length))
+        return addr
+    except Exception as e:
+        print("Error creating string at %s: %s" % (addr, str(e)))
+        return None
 
-
-def create_string_at(addr, length):
+def scan_memory_for_strings(min_len=4):
     """
-    Convert raw bytes at addr into a Ghidra ASCII string data type and apply a label.
+    Scan non-executable memory blocks for printable ASCII runs.
+    Creates StringData entries for runs >= min_len.
     """
-    str_type = StringDataInstance.getStringDataType()
+    total = 0
+    for blk in memory.getBlocks():
+        if not blk.isInitialized() or blk.isExecute():
+            continue
+        base = blk.getStart()
+        size = blk.getSize()
+        bb = read_bytes(base, size)
+        if bb is None:
+            continue
 
-    DataUtilities.createData(
-        currentProgram,
-        addr,
-        str_type,
-        length + 1,  
-        False,
-        DataTypeConflictHandler.DEFAULT_HANDLER
-    )
+        run_start = None
+        run_bytes = bytearray()
+        for i, b in enumerate(bb):
+            if is_printable_ascii(b):
+                if run_start is None:
+                    run_start = base.add(i)
+                run_bytes.append(b)
+            else:
+                if run_start and len(run_bytes) >= min_len:
+                    create_string_at(run_start, len(run_bytes))
+                    total += 1
+                run_start = None
+                run_bytes = bytearray()
+        if run_start and len(run_bytes) >= min_len:
+            create_string_at(run_start, len(run_bytes))
+            total += 1
+    print("Total strings created: %d" % total)
 
-    # If no label exists, create one
-    symbol = getSymbolAt(addr)
-    if symbol is None:
-        raw_name = get_string_preview(addr, length)
-        label = "str_" + raw_name
-        createLabel(addr, label, False)
-
-    return getSymbolAt(addr).getName()
-
-
-def get_string_preview(addr, length):
-    """Return a small label-friendly name from string content (alphanumeric only)."""
-    name = ""
-    for i in range(length):
-        c = chr(getByte(addr.add(i)))
-        if c.isalnum():
-            name += c
-    if len(name) == 0:
-        name = "unk"
-    return name[:12]
-
-
-def add_xrefs(addr):
-    """Finds and logs cross-references to the string at this address."""
-    refs = getReferencesTo(addr)
-    for ref in refs:
-        from_addr = ref.getFromAddress()
-        func = getFunctionContaining(from_addr)
-        if func:
-            print("    XREF from {} in function {}".format(from_addr, func.getName()))
-        else:
-            print("    XREF from {}".format(from_addr))
-
-
-def scan_memory_for_strings():
-    """
-    Scans all memory blocks for ASCII strings, creates string data,
-    labels them, and reports xrefs.
-    """
-    memory = currentProgram.getMemory()
-    print("[*] Scanning memory for strings + xrefs...")
-
-    for block in memory.getBlocks():
-        start = block.getStart()
-        end   = block.getEnd()
-        addr  = start
-
-        while addr <= end:
-            run_start = addr
-            run_bytes = []
-
-            # Gather bytes while printable
-            while addr <= end and is_printable_ascii(getByte(addr)):
-                run_bytes.append(getByte(addr))
-                addr = addr.add(1)
-
-            # If we found a valid string, define it & process xrefs
-            if len(run_bytes) >= MIN_STR_LEN:
-                label = create_string_at(run_start, len(run_bytes))
-                print("[+] String at {} -> '{}'".format(run_start, label))
-                add_xrefs(run_start)
-
-            addr = addr.add(1)
-
-    print("[*] String scan completed.")
-
-
-# Entrypoint for Ghidra
-if __name__ == "__main__" or str(__name__).startswith("__main__"):
+if __name__ == "__main__":
     scan_memory_for_strings()
