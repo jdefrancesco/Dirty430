@@ -4,24 +4,21 @@
 # - RC4 (256-byte permutation detection, KSA/PRGA heuristics, key extraction, KSA emulation verification)
 # - RC4-like variants: VMPC and RC4A heuristics (dual S-boxes, dual PRGA)
 # - AES S-box / inv-S-box / Rcon detection
-# - CRC table heuristics (CRC16 and CRC32)
-# - XTEA/TEA heuristics (constants and ARX patterns)
-# - PRNG detection (Knuth subtractive, NR ran1, RANDU, LCG)
+# - CRC table heuristics 
+# - XTEA/TEA heuristics 
+# - PRNG detection 
 # - Global modulo recognition (mask/div/sub/shift+mask) and bit-rotation recognition
-# - Runtime S[] detection (detect writes to RAM that populate 256-byte tables)
+# - Runtime S[] detection - detect writes to RAM that populate 256-byte tables
 # - RC4A emulation and static-table verification using key "testkey"
-# - Adds Bookmarks and Plate comments (no renaming/modification)
-#
-# 
-#
+# - Adds Bookmarks and Plate comments 
+
+
 #@category DataCrypto
 #@author J. DeFrancesco
 
-from ghidra.program.model.address import Address
 from ghidra.program.model.listing import CodeUnit
 from ghidra.util.task import ConsoleTaskMonitor
 from ghidra.app.decompiler import DecompInterface
-from ghidra.program.model.mem import MemoryAccessException
 from javax.swing import JOptionPane, JScrollPane, JTextArea
 
 import re
@@ -195,7 +192,6 @@ def _is_power_of_two_minus_one(mask):
         return False
     return ((mask + 1) & mask) == 0
 
-# ---------- Permutation and identity checks ----------
 
 def _perm_check_bytes(bb, off):
     """
@@ -531,33 +527,6 @@ def detect_rc4a_in_decomp(ctext):
     xor_two_arrays = RE_ARRAY_XOR.search(low) is not None
     return bool(two_heavy or xor_two_arrays)
 
-# def detect_rotations_in_decomp(func, ctext):
-#     """
-#     Detect expressions like (x << n) | (x >> m) that imply rotates.
-
-#     :param func: Function for bookmarking
-#     :param ctext: Decompiled C text
-#     :type ctext: str
-#     :return: Count of rotation-like annotations added
-#     :rtype: int
-#     """
-
-#     if ctext is None:
-#         return 0
-#     hits = 0
-#     low = ctext.lower()
-#     for m in RE_ROT_LIKE.finditer(low):
-#         try:
-#             n = int(m.group(2))
-#             mval = int(m.group(3))
-#             total = n + mval
-#             if total in (8, 16, 32):
-#                 note(func.getEntryPoint(), BOOKMARK_ROT, "ROTATE", "Rotate-like expression (<<%d | >>%d) on width %d" % (n, mval, total))
-#                 hits += 1
-#         except:
-#             pass
-#     return hits
-
 
 def mark_rc4_instr_patterns(func):
     """
@@ -714,7 +683,7 @@ def detect_rotations_and_mod(func, ctext):
     mod_hits = mark_modulo_patterns(func)
     return {"rot": 0, "mod": mod_hits}
 
-#
+
 
 def mark_modulo_patterns(func):
     """
@@ -1351,7 +1320,6 @@ def main():
     """
 
     print("==== [D430] Crypto Scanner =====")
-    start = time.time()
     note(currentProgram.getMinAddress(), BOOKMARK_CRYPTO, "Info", "D430 Scanner mark.")
 
     # Data scans
@@ -1366,7 +1334,7 @@ def main():
     print("[D430] Verifying RC4A pairs using testkey")
     rc4a_emu_matches = verify_rc4a_pairs_static(rc4a_pairs)
 
-    # Runtime S detection (ASM-based)
+    # Runtime S detection - ASM-based so finer grain..
     print("[D430] Scanning for runtime RC4 S initialization")
     runtime_s_hits = find_rc4_state_in_ram()
 
@@ -1390,9 +1358,9 @@ def main():
             io_hits_total += len(hits)
             usci_count += 1
 
-    elapsed = time.time() - start
+
+    print("[D430] Crypto Scan Finished!")
     lines = []
-    lines.append("D430 scan complete in %.2f s" % (elapsed,))
     lines.append("CRC16 constants found: %d" % (len(crc16_hits),))
     lines.append("RC4 S[] tables (static): %d" % (len(tables),))
     lines.append("RC4 S[] runtime buffers: %d" % (len(runtime_s_hits),))

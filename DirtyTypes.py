@@ -1,6 +1,6 @@
 # DirtyTypes.py
 # This script allows you to create data structures via inserting C code into the popup dialog
-# instead of using the painful GUI option... 
+# instead of using the painful GUI option...
 
 #@author J. DeFrancesco
 #@category DataTypes
@@ -22,7 +22,7 @@ def run():
     scroll.setPreferredSize(Dimension(800, 500))
 
     result = JOptionPane.showConfirmDialog(
-        None, scroll, "Enter your C typedefs / struct:", 
+        None, scroll, "Enter your C typedefs / struct:",
         JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE
     )
 
@@ -48,6 +48,6 @@ def run():
         print("Success!")
     except Exception as e:
         print(e)
-        
+
 if __name__ == "__main__":
     run()
