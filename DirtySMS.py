@@ -32,6 +32,9 @@ SWEEP_WINDOW_BYTES = 512     # sliding window size to try across binary
 SWEEP_STEP = 8               # jump step between start offsets to reduce noise (
 MAX_CHUNK_SWEEP = 0x4000     # chunk size when reading memory for sweep
 
+
+# Keep as lowercase and just normalize what i compare it against. If user has weird display
+# options is might not match with all uppercase. Figured that out on accident..
 UART_NAMES = [
     "uca0txbuf", "uca1txbuf", "uca2txbuf",
     "ucb0txbuf", "ucb1txbuf", "ucb2txbuf",
@@ -57,6 +60,8 @@ RE_SHIFT_LEFT = re.compile(r'<<\s*([0-7])')
 RE_SHIFT_RIGHT = re.compile(r'>>\s*([0-7])')
 RE_MASK_7F = re.compile(r'&\s*0x?7f\b', re.IGNORECASE)
 RE_HEX = re.compile(r'^[0-9A-Fa-f]+$')
+RE_GSM_INIT = re.compile(r"AT\+C(PIN|REG|SQ|GATT|GDCONT|GSN|GMI|GMM)", re.IGNORECASE)
+RE_PDU_HEADER = re.compile(r"(0791|0011|A7|F1)[0-9A-F]{8,}", re.IGNORECASE)
 
 #  GSM 03.38 Table
 def build_gsm0338_tables():
@@ -98,7 +103,15 @@ def build_gsm0338_tables():
     return basic, extended
 
 GSM_BASIC, GSM_EXT = build_gsm0338_tables()
+# NOTE: MSP430f54380 only supports bauds 9600 or 57600 accoding to data sheet.
+GSM_BAUDS = [9600, 19200, 38400, 57600, 115200]
+GSM_HANDSHAKE = ["AT\r", "ATZ", "ATE0", "AT&F", "ATI"]
 
+PDU_HEADERS = ["0791", "0011", "A7", "F1"]
+CTRLZ_HEX = [0x1A]
+SMS_PROMPT = [">"]
+SMS_LENGTH_HINTS = [140, 160, 0x8C, 0xA0]
+                    
 memory = currentProgram.getMemory()
 listing = currentProgram.getListing()
 fm = currentProgram.getFunctionManager()
@@ -251,6 +264,7 @@ def gsm7338_map_septets_to_text(septets):
         i += 1
     return ''.join(out)
 
+
 def printable_ratio(txt):
     """Compute printable ASCII ratio."""
 
@@ -262,7 +276,23 @@ def printable_ratio(txt):
             count += 1
     return float(count) / float(len(txt))
 
-VERBOSE = False  # set True for full septet sweep 
+
+def text_entropy(txt):
+    """Compute Shannon entropy by byte for ASCII text."""
+    if not txt:
+        return 0.0
+    from math import log
+    freq = {}
+    for c in txt:
+        freq[c] = freq.get(c, 0) + 1
+    H = 0.0
+    for c in freq:
+        p = float(freq[c]) / float(len(txt))
+        H -= p * log(p, 2)
+    return H
+
+
+VERBOSE = False  # toggle for full debug output
 def sweep_septets_global():
     """Perform a global brute-force septet sweep across initialized memory blocks.
 
@@ -292,8 +322,7 @@ def sweep_septets_global():
                     if max_sept_possible < MIN_SEPTET_LEN:
                         continue
                     max_sept = min(MAX_SEPTET_LEN, max_sept_possible)
-                    trial_lengths = []
-                    trial_lengths.append(max_sept)
+                    trial_lengths = [max_sept]
                     mid = (max_sept + MIN_SEPTET_LEN) // 2
                     if mid != max_sept and mid >= MIN_SEPTET_LEN:
                         trial_lengths.append(mid)
@@ -329,17 +358,21 @@ def sweep_septets_global():
                         if not re.search(r'[A-Za-z0-9+ ]', txt):
                             continue
 
+                        H = text_entropy(txt)
+                        if H < 2.5:
+                            continue
+
                         addr = base.add(pos)
                         text_preview = txt[:40] + ("..." if len(txt) > 40 else "")
-                        msg = "Septet sweep: bit_shift=%d septets=%d printable=%.2f text=%s" % (
-                            bit_shift, sept_len, pr, text_preview)
+                        msg = "Septet sweep: bit_shift=%d septets=%d printable=%.2f entropy=%.2f text=%s" % (
+                            bit_shift, sept_len, pr, H, text_preview)
 
                         note(addr, BOOKMARK_PDU_DECODE, "SEPTET_SWEEP", msg)
                         findings.append((addr, bit_shift, sept_len, pr, txt))
 
                         if VERBOSE:
-                            print("DEBUG bit_shift=%d sept_len=%d pr=%.2f text=%s"
-                                  % (bit_shift, sept_len, pr, text_preview))
+                            print("DEBUG bit_shift=%d sept_len=%d pr=%.2f H=%.2f text=%s"
+                                  % (bit_shift, sept_len, pr, H, text_preview))
 
                         pos += octets_needed
                         break
@@ -348,7 +381,78 @@ def sweep_septets_global():
     return findings
 
 
-# PDU parsing helpers from previous script: semi-octet swap, decode number, simple PDU parse.
+def correlate_and_run_sweep():
+    """Run AT string detection, UART detection, PDU parse, GSM7 function heuristic, and global sweep.
+    
+    Used entropy as a heuristic to keep output from being to damn noisy..
+    """
+
+    strings = find_all_defined_strings()
+    at_hits = search_strings_for(SMS_CMDS + GSM_INIT + GSM_RESPONSES, strings)
+
+    fmgr = fm
+    at_ref_funcs = {}
+    for (addr, s) in at_hits:
+        refs = get_code_refs_to(addr)
+        for ra in refs:
+            f = fmgr.getFunctionContaining(ra)
+            if f:
+                at_ref_funcs.setdefault(f.getName(), set()).add(f)
+
+    uart_hits = find_uart_writes()
+
+    flagged = []
+    for f in fmgr.getFunctions(True):
+        score, bit_addrs = detect_gsm7_patterns(f)
+        has_uart = False
+        for (ff, a, n) in uart_hits:
+            if ff == f:
+                has_uart = True
+                break
+        pdu_near = find_pdu_hex_near(f, SWEEP_WINDOW_BYTES)
+
+        decoded_near = []
+        if score > 0:
+            decoded_near = find_candidate_gsm7_windows_near_func(f, SWEEP_WINDOW_BYTES)
+
+        ep = f.getEntryPoint()
+        if score > 0:
+            note(ep, BOOKMARK_PDU, "PDU_FUNC", "GSM7 heuristic score=%d" % score)
+
+        for (a, hexs, parsed) in pdu_near:
+            note(a, BOOKMARK_PDU, "PDU_HEX", "PDU hex near %s" % f.getName())
+            if parsed and parsed.get("ud_text"):
+                txt = parsed.get("ud_text")
+                H = text_entropy(txt)
+                if H < 2.5:
+                    continue
+                txt_preview = txt[:80] + ("..." if len(txt) > 80 else "")
+                note(a, BOOKMARK_PDU_DECODE, "PDU_UD",
+                     "PDU UD (decoded SMS): %s" % txt_preview)
+
+        for (addr, septs, pr, txt) in decoded_near:
+            txt_preview = txt[:80] + ("..." if len(txt) > 80 else "")
+            note(addr, BOOKMARK_PDU_DECODE, "PDU_DECODE",
+                 "Decoded %d septets printable=%.2f: %s" % (septs, pr, txt_preview))
+
+        f_in_at = f.getName() in at_ref_funcs
+        if f_in_at and has_uart and (score > 0 or len(pdu_near) > 0 or len(decoded_near) > 0):
+            note(ep, BOOKMARK_SMS, "SMS_TX_FUNC",
+                 "Likely SMS TX: AT refs + UART + GSM7/PDU")
+            flagged.append((f, score, has_uart, len(pdu_near), len(decoded_near)))
+
+    sweep_results = sweep_septets_global()
+
+    return {
+        "at_literals": len(at_hits),
+        "uart_sites": len(uart_hits),
+        "flagged_funcs": len(flagged),
+        "sweep_hits": len(sweep_results)
+    }
+
+# PDU parsing helpers: semi-octet swap, decode number, simple PDU parse.
+# These should be enough to get us going.
+
 def semi_octet_swap(hex_digits):
     """Swap semi-octets in a hex string like '123456' -> '214365'."""
 
@@ -372,9 +476,8 @@ def decode_number_from_toa_addr(addr_hex, toa_hex, digits_len):
         return '+' + digits
     return digits
 
-# Attempt at minimal PSU parsing.. Handles basics for now.
 def pdu_try_parse_hex(hexstr_bytes):
-    """Attempt to parse minimal PDU hexstring (returns dict or None)."""
+    """Attempt to parse minimal PDU hexstring."""
 
     try:
         hexstr = ''.join(chr(c) for c in hexstr_bytes)
@@ -490,63 +593,7 @@ def find_pdu_hex_near(func, window_bytes):
                 results.append((a, s_stripped, parsed))
     return results
 
-def correlate_and_run_sweep():
-    """Run AT string detection, UART detection, PDU parse, GSM7 function heuristic, and global sweep."""
 
-    strings = find_all_defined_strings()
-    at_hits = search_strings_for(SMS_CMDS + GSM_INIT + GSM_RESPONSES, strings)
-
-    fmgr = fm
-    at_ref_funcs = {}
-    for (addr, s) in at_hits:
-        refs = get_code_refs_to(addr)
-        for ra in refs:
-            f = fmgr.getFunctionContaining(ra)
-            if f:
-                at_ref_funcs.setdefault(f.getName(), set()).add(f)
-
-    uart_hits = find_uart_writes()
-
-    flagged = []
-    for f in fmgr.getFunctions(True):
-        score, bit_addrs = detect_gsm7_patterns(f)
-        has_uart = False
-        for (ff, a, n) in uart_hits:
-            if ff == f:
-                has_uart = True
-                break
-        pdu_near = find_pdu_hex_near(f, SWEEP_WINDOW_BYTES)
-
-        decoded_near = []
-        if score > 0:
-            decoded_near = find_candidate_gsm7_windows_near_func(f, SWEEP_WINDOW_BYTES)
-
-        ep = f.getEntryPoint()
-        if score > 0:
-            note(ep, BOOKMARK_PDU, "PDU_FUNC", "GSM7 heuristic score=%d" % score)
-
-        for (a, hexs, parsed) in pdu_near:
-            note(a, BOOKMARK_PDU, "PDU_HEX", "PDU hex near %s" % f.getName())
-            if parsed and parsed.get("ud_text"):
-                note(a, BOOKMARK_PDU_DECODE, "PDU_UD", "PDU UD: %s" % parsed.get("ud_text")[:120])
-
-        for (addr, septs, pr, txt) in decoded_near:
-            note(addr, BOOKMARK_PDU_DECODE, "PDU_DECODE", "Decoded %d septets printable=%.2f: %s" % (septs, pr, txt[:120]))
-
-        f_in_at = f.getName() in at_ref_funcs
-        if f_in_at and has_uart and (score > 0 or len(pdu_near) > 0 or len(decoded_near) > 0):
-            note(ep, BOOKMARK_SMS, "SMS_TX_FUNC", "Likely SMS TX: AT refs + UART + GSM7/PDU")
-            flagged.append((f, score, has_uart, len(pdu_near), len(decoded_near)))
-
-    # now run global septet sweep which is heavier
-    sweep_results = sweep_septets_global()
-
-    return {
-        "at_literals": len(at_hits),
-        "uart_sites": len(uart_hits),
-        "flagged_funcs": len(flagged),
-        "sweep_hits": len(sweep_results)
-    }
 
 def find_candidate_gsm7_windows_near_func(func, window_bytes):
     """Wrapper to reuse existing near-function decode logic from prior code."""
